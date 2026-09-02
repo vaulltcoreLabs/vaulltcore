@@ -1,0 +1,19 @@
+{
+  "name": "@vaulltcore/recovery",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/automation": "*",
+    "@vaulltcore/ops": "*",
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/audit": "*"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

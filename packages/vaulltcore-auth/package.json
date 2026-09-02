@@ -1,0 +1,18 @@
+{
+  "name": "@vaulltcore/auth",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/identity": "*",
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/audit": "*",
+    "better-auth": "^1.7.1"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@vaulltcore/reliability",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/ops": "*",
+    "@vaulltcore/automation": "*",
+    "@vaulltcore/quota": "*",
+    "@vaulltcore/audit": "*",
+    "@vaulltcore/store-sql": "*"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

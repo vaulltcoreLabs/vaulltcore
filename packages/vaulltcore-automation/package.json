@@ -1,0 +1,19 @@
+{
+  "name": "@vaulltcore/automation",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/runner": "*",
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/identity": "*",
+    "@vaulltcore/audit": "*",
+    "@vaulltcore/integration": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

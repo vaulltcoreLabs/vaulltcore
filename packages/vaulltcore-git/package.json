@@ -1,0 +1,16 @@
+{
+  "name": "@vaulltcore/git",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/integration": "*",
+    "@vaulltcore/credentials": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

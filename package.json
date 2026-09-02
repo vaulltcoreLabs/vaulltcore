@@ -1,0 +1,26 @@
+{
+  "name": "vaulltcore",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Vaulltcore — B2B AI Engineering Automation platform. Phase 1A execution foundation.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run",
+    "typecheck": "tsc --build packages/*",
+    "start": "tsx packages/vaulltcore-control/src/serve.ts"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.5",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "better-auth": "^1.7.1",
+    "pg": "^8.23.0",
+    "tsx": "^4.7.0"
+  }
+}

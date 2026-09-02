@@ -1,0 +1,19 @@
+{
+  "name": "@vaulltcore/usage-governance",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/metering": "*",
+    "@vaulltcore/billing": "*",
+    "@vaulltcore/quota": "*",
+    "@vaulltcore/audit": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "@vaulltcore/control",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/runner": "*",
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/worker": "*",
+    "@vaulltcore/identity": "*",
+    "@vaulltcore/policy": "*",
+    "@vaulltcore/quota": "*",
+    "@vaulltcore/metering": "*",
+    "@vaulltcore/billing": "*",
+    "@vaulltcore/audit": "*",
+    "@vaulltcore/reconcile": "*",
+    "@vaulltcore/automation": "*",
+    "@vaulltcore/scheduler": "*",
+    "@vaulltcore/ops": "*",
+    "@vaulltcore/credentials": "*",
+    "@vaulltcore/integration": "*",
+    "@vaulltcore/git": "*",
+    "@vaulltcore/connectors": "*",
+    "@vaulltcore/models": "*",
+    "@vaulltcore/webhooks": "*",
+    "@vaulltcore/reliability": "*",
+    "@vaulltcore/usage-governance": "*",
+    "@vaulltcore/auth": "*",
+    "@vaulltcore/runner-opencode": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

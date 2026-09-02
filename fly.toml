@@ -1,0 +1,36 @@
+# fly.toml - Vaulltcore deployment configuration
+# Docs: https://fly.io/docs/reference/configuration/
+
+app = "vaulltcore"
+primary_region = "iad"
+
+# Health check configuration
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+
+# Environment variables (set via Fly.io secrets)
+# Required:
+#   DATABASE_URL - Neon PostgreSQL connection string (format: postgres://user:pass@ep-xxx.region.aws.neon.tech/dbname?sslmode=require)
+#   BETTER_AUTH_SECRET - Better Auth session secret
+#   SESSION_SECRET - Session encryption secret
+#
+# Neon Setup:
+#   1. Create a free account at https://neon.tech
+#   2. Create a new project (选择 AWS region closest to your Fly.io region)
+#   3. Copy the connection string from the Neon dashboard
+#   4. The connection string already includes sslmode=require
+#   5. Set it as a Fly.io secret: fly secrets set DATABASE_URL="postgres://..."

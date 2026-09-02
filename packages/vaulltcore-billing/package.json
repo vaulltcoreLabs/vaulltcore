@@ -1,0 +1,17 @@
+{
+  "name": "@vaulltcore/billing",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/runner": "*",
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/metering": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

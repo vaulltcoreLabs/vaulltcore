@@ -1,0 +1,31 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/vaulltcore-runner" },
+    { "path": "packages/vaulltcore-runner-opencode" },
+    { "path": "packages/vaulltcore-store-sql" },
+    { "path": "packages/vaulltcore-environment-cloud" },
+    { "path": "packages/vaulltcore-identity" },
+    { "path": "packages/vaulltcore-policy" },
+    { "path": "packages/vaulltcore-quota" },
+    { "path": "packages/vaulltcore-metering" },
+    { "path": "packages/vaulltcore-billing" },
+    { "path": "packages/vaulltcore-audit" },
+    { "path": "packages/vaulltcore-reconcile" },
+    { "path": "packages/vaulltcore-control" },
+    { "path": "packages/vaulltcore-automation" },
+    { "path": "packages/vaulltcore-artifacts" },
+    { "path": "packages/vaulltcore-delivery" },
+    { "path": "packages/vaulltcore-ops" },
+    { "path": "packages/vaulltcore-scheduler" },
+    { "path": "packages/vaulltcore-recovery" },
+    { "path": "packages/vaulltcore-credentials" },
+    { "path": "packages/vaulltcore-integration" },
+    { "path": "packages/vaulltcore-git" },
+    { "path": "packages/vaulltcore-connectors" },
+    { "path": "packages/vaulltcore-models" },
+    { "path": "packages/vaulltcore-webhooks" },
+    { "path": "packages/vaulltcore-reliability" },
+    { "path": "packages/vaulltcore-usage-governance" }
+  ]
+}

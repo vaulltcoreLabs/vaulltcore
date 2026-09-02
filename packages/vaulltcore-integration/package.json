@@ -1,0 +1,18 @@
+{
+  "name": "@vaulltcore/integration",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@vaulltcore/credentials": "*",
+    "@vaulltcore/delivery": "*",
+    "@vaulltcore/audit": "*",
+    "@vaulltcore/store-sql": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}
