@@ -22,7 +22,8 @@ import { SqlOpsStore } from "@vaulltcore/ops"
 import { ModelRegistry, ModelConnectionService } from "@vaulltcore/models"
 import { SqlCredentialStore, CredentialResolver, EnvSecretProvider, SqlAuthorizationAttemptStore, ConnectionLifecycle, OAuthAdapterRegistry } from "@vaulltcore/credentials"
 import { SqlTriggerStore, TriggerDispatchService } from "@vaulltcore/automation"
-import { SqlB2bAuthStore, BetterAuthAdapter, ActorResolver, ServiceIdentityService } from "@vaulltcore/auth"
+import { SqlB2bAuthStore, BetterAuthAdapter, ActorResolver, ServiceIdentityService, type EmailServiceLike } from "@vaulltcore/auth"
+import { DefaultEmailService, ResendEmailProvider, DevelopmentEmailProvider } from "@vaulltcore/email"
 import { GitHubOAuthAdapter, GitLabOAuthAdapter } from "@vaulltcore/git"
 import { SqlWebhookStore } from "@vaulltcore/webhooks"
 import { SqlAdmissionIdempotencyRegistry } from "@vaulltcore/store-sql"
@@ -54,7 +55,7 @@ async function resolveActor(
  *  configured: machine credentials only via the durable API-key store.
  *
  *  The header box (`HeaderAuthenticator`) is test/dev-only; it must never
- *  be the blind default for a serve without explicit headers � a client
+ *  be the blind default for a serve without explicit headers — a client
  *  could otherwise self-assert tenant identity. The bearer secret is
  *  verified against `api_keys` (fingerprint-only, server-side authority),
  *  which is the same path phase2g uses for machine credentials. */
@@ -230,14 +231,71 @@ async function main(): Promise<void> {
   let authStore: SqlB2bAuthStore | null = null
   if (authSecret && authSecret.length >= 32) {
     authStore = new SqlB2bAuthStore(database)
+    // Phase 3/4 — Email delivery. Production wires Resend (server-only
+    // RESEND_API_KEY; never in frontend env vars/logs/errors); dev wires the
+    // explicit dev sink ONLY. There is deliberately NO silent fallback from
+    // Resend to the sink: if RESEND_API_KEY is configured the Resend provider is
+    // constructed and any delivery failure FAILS LOUDLY (non-2xx throws)..
+    const resendKey = process.env.RESEND_API_KEY
+    const devEmail = process.env.NODE_ENV !== "production" && process.env.AUTH_DEV_EMAIL_SINK === "true"
+    let emailService: EmailServiceLike | null = null
+    const toEmailService = (
+      svc: InstanceType<typeof DefaultEmailService>,
+    ): EmailServiceLike => ({
+      providerId: svc.providerId,
+      send: async (email) => {
+        const { toEmail, ...rest } = email
+        return svc.send({ ...rest, to: toEmail })
+      },
+    })
+    if (resendKey) {
+      emailService = toEmailService(new DefaultEmailService(new ResendEmailProvider({
+        apiKey: resendKey,
+        from: process.env.RESEND_FROM_EMAIL ?? "auth@vaulltcore.app",
+        fromName: process.env.RESEND_FROM_NAME ?? "Vaulltcore",
+      })))
+    } else if (devEmail) {
+      emailService = toEmailService(new DefaultEmailService(new DevelopmentEmailProvider({ enabled: true, allowInProduction: true })))
+    }
+    const trustedOrigins = (process.env.AUTH_TRUSTED_ORIGINS ?? "")
+      .split(",").map((o) => o.trim()).filter(Boolean)
+    const genericOidc = (process.env.AUTH_OIDC_PROVIDERS ?? "").split(",").map((raw) => raw.trim()).filter(Boolean).map((id) => {
+      const env = "AUTH_OIDC_" + id.toUpperCase().replace(/-/g, "_")
+      return {
+        providerId: id,
+        name: process.env[env + "_NAME"],
+        discoveryUrl: process.env[env + "_DISCOVERY_URL"] ?? "",
+        clientId: process.env[env + "_CLIENT_ID"] ?? "",
+        clientSecret: process.env[env + "_CLIENT_SECRET"],
+        scopes: (process.env[env + "_SCOPES"] ?? "").split(",").map((sc) => sc.trim()).filter(Boolean),
+        requireEmailVerification: process.env.AUTH_REQUIRE_EMAIL_VERIFICATION === "true",
+      }
+    }).filter((cfg) => Boolean(cfg.discoveryUrl && cfg.clientId))
     betterAuth = new BetterAuthAdapter({
       // Better Auth's kysely adapter needs the CONCRETE node:sqlite driver
       // (`DatabaseSync`); for PostgreSQL we reuse the pg Pool the SqlStore seam
       // already drives (better-auth/kysely auto-detects the dialect).
-      database: isNodeSqlite ? (database as NodeSqliteDatabase).raw() : database,
+      database:isNodeSqlite ? (database as NodeSqliteDatabase).raw() : database,
       secret: authSecret,
       baseURL: authBaseUrl,
-      // No OAuth provider SDKs wired; email/password session login only.
+      ...(trustedOrigins.length ? { trustedOrigins } : {}),
+      ...(emailService ? { emailService } : {}),
+      requireEmailVerification: process.env.AUTH_REQUIRE_EMAIL_VERIFICATION === "true",
+      ...(process.env.AUTH_SESSION_MAX_AGE_SECONDS ? { sessionMaxAge: Number(process.env.AUTH_SESSION_MAX_AGE_SECONDS) } : {}),
+      ...(process.env.AUTH_SESSION_UPDATE_AGE_SECONDS ? { sessionUpdateAge: Number(process.env.AUTH_SESSION_UPDATE_AGE_SECONDS) } : {}),
+      ...(process.env.AUTH_SECURE_COOKIES ? { useSecureCookies: process.env.AUTH_SECURE_COOKIES === "true" } : {}),
+      ...(process.env.AUTH_RATE_LIMIT_MAX ? { rateLimit: { windowSec: Number(process.env.AUTH_RATE_LIMIT_WINDOW_SECONDS ?? 60), max: Number(process.env.AUTH_RATE_LIMIT_MAX), enabled: process.env.AUTH_RATE_LIMIT_ENABLED !== "false" } } : {}),
+      ...(process.env.AUTH_GOOGLE_CLIENT_ID && process.env.AUTH_GOOGLE_CLIENT_SECRET ? { google: { clientId: process.env.AUTH_GOOGLE_CLIENT_ID, clientSecret: process.env.AUTH_GOOGLE_CLIENT_SECRET } } : {}),
+      ...(process.env.AUTH_GITHUB_CLIENT_ID && process.env.AUTH_GITHUB_CLIENT_SECRET ? { github: { clientId: process.env.AUTH_GITHUB_CLIENT_ID, clientSecret: process.env.AUTH_GITHUB_CLIENT_SECRET } } : {}),
+      ...(genericOidc.length ? { genericOidc } : {}),
+      ...(process.env.AUTH_TWO_FACTOR_ENFORCE === "true" ? { twoFactor: {
+        issuer: process.env.AUTH_TWO_FACTOR_ISSUER ?? "Vaulltcore",
+        ...(process.env.AUTH_2FA_COOKIE_MAX_AGE_SECONDS ? { twoFactorCookieMaxAge: Number(process.env.AUTH_2FA_COOKIE_MAX_AGE_SECONDS) } : {}),
+        ...(process.env.AUTH_2FA_TRUST_DEVICE_MAX_AGE_SECONDS ? { trustDeviceMaxAge: Number(process.env.AUTH_2FA_TRUST_DEVICE_MAX_AGE_SECONDS) } : {}),
+        ...(process.env.AUTH_2FA_BACKUP_CODE_AMOUNT ? { backupCodeAmount: Number(process.env.AUTH_2FA_BACKUP_CODE_AMOUNT) } : {}),
+        enforceForEmailPassword: true,
+        allowedPasswordlessMethods: ["magic-link", "email-otp", "oauth"],
+      } } : {}),
     })
     await betterAuth.migrate()
   }
