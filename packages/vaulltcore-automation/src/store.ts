@@ -114,7 +114,7 @@ export const AUTOMATION_MIGRATIONS: readonly Migration[] = [
         input_revision_id TEXT PRIMARY KEY,
         run_id            TEXT NOT NULL REFERENCES automation_runs (run_id) ON DELETE CASCADE,
         checksum          TEXT NOT NULL,
-        values            TEXT NOT NULL,
+        "values"         TEXT NOT NULL,
         created_at        BIGINT NOT NULL
       )`,
       `CREATE INDEX automation_run_inputs_run_idx ON automation_run_inputs (run_id)`,
@@ -638,7 +638,7 @@ export class SqlAutomationStore extends SqlStoreBase implements AutomationStore 
   // -- inputs --------------------------------------------------------------
   async saveInputRevision(revision: RunInputRevision): Promise<void> {
     this.atomic("saveInputRevision", () => {
-      this.prepare("INSERT INTO automation_run_inputs (input_revision_id, run_id, checksum, values, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      this.prepare("INSERT INTO automation_run_inputs (input_revision_id, run_id, checksum, \"values\", created_at) VALUES (?, ?, ?, ?, ?)").run(
         revision.inputRevisionId,
         revision.runId,
         revision.checksum,

@@ -10,31 +10,13 @@ import { usageApi } from "@/lib/api/usage";
 import { operationsApi } from "@/lib/api/operations";
 import type { AppRepositories } from "./interfaces";
 
-function getAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (typeof window !== "undefined") {
-    const tenant = localStorage.getItem("vc-tenant");
-    if (tenant) headers["x-vc-tenant"] = tenant;
-    const org = localStorage.getItem("vc-org");
-    if (org) headers["x-vc-org"] = org;
-    const project = localStorage.getItem("vc-project");
-    if (project) headers["x-vc-project"] = project;
-  }
-  return headers;
-}
-
-async function rawFetch<T>(path: string): Promise<T> {
-  const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:3000"}${path}`, {
-    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-    credentials: "include",
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
+// All repository transports go through the centralized `apiRequest` client in
+// `lib/api` — base URL, auth, tenant handling,, error normalization,, and
+// idempotency live there. No repository may open its own fetch/HTTP stack.
 
 export const realRepositories: AppRepositories = {
   jobs: {
-    async list() { return rawFetch("/jobs"); },
+    async list() { return jobsApi.list(); },
     async get(jobId) { return jobsApi.get(jobId); },
     async events(jobId, opts) { return jobsApi.events(jobId, opts); },
     async cancel(jobId) { return jobsApi.cancel(jobId); },
@@ -50,7 +32,7 @@ export const realRepositories: AppRepositories = {
       async createVersion(templateId, body) { return automationApi.templates.createVersion(templateId, body); },
     },
     runs: {
-      async list() { return rawFetch("/automation/runs"); },
+      async list() { return automationApi.runs.list(); },
       async get(runId) { return automationApi.runs.get(runId); },
       async events(runId, opts) { return automationApi.runs.events(runId, opts); },
       async artifacts(runId) { return automationApi.runs.artifacts(runId); },
@@ -121,6 +103,6 @@ export const realRepositories: AppRepositories = {
   },
 
   metrics: {
-    async get() { return rawFetch("/automation/metrics"); },
+    async get() { return automationApi.metrics(); },
   },
 };

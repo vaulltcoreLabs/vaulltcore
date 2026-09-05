@@ -259,6 +259,14 @@ export const AUTOMATION_ROUTES: AutomationRoute[] = [
       handleAutomationError(error, ctx, res)
     }
   }),
+  route("GET", "/automation/runs", async (req, res, _params, authn, query, ctx) => {
+    const principal = await resolveOrFail(ctx, req, res, authn)
+    if (!principal) return
+    const orgId = query.get("orgId") ?? undefined
+    const projectId = query.get("projectId") ?? undefined
+    const runs = await ctx.service.listRuns(principal, orgId, projectId)
+    ctx.json(res, 200, { runs })
+  }),
   route("GET", "/automation/runs/:runId", async (req, res, params, authn, _query, ctx) => {
     const principal = await resolveOrFail(ctx, req, res, authn)
     if (!principal) return

@@ -5,19 +5,37 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuth } from "@/lib/auth";
 
+const devHeaderAuth = import.meta.env.VITE_DEV_HEADER_AUTH === "true";
+
 export default function AuthPage() {
-  const { isAuthenticated, setDevHeaders } = useAuth();
+  const { isAuthenticated, signInWithApiKey, setDevHeaders } = useAuth();
   const navigate = useNavigate();
+  const [apiKey, setApiKey] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [tenant, setTenant] = useState("vaulltcore-dev");
   const [org, setOrg] = useState("default");
   const [project, setProject] = useState("");
 
-  // Redirect if already authenticated
   React.useEffect(() => {
     if (isAuthenticated) {
       navigate("/dashboard", { replace: true });
     }
   }, [isAuthenticated, navigate]);
+
+  const handleApiKeyAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    try {
+      await signInWithApiKey(apiKey.trim());
+      navigate("/dashboard", { replace: true });
+    } catch {
+      setError("Invalid or expired API key. Contact your administrator to mint a machine credential for this environment.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const handleDevAuth = (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,7 +46,6 @@ export default function AuthPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
       <div className="w-full max-w-md space-y-6">
-        {/* Logo */}
         <div className="text-center">
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-primary text-primary-foreground font-bold text-xl">
             V
@@ -41,46 +58,55 @@ export default function AuthPage() {
           <CardHeader>
             <CardTitle>Sign In</CardTitle>
             <CardDescription>
-              Configure your development environment credentials.
-              Production authentication uses Better Auth session cookies.
+              Machine credentials are verified by the server. Session-cookie sign-in
+              appears here when Better Auth is configured.
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <form onSubmit={handleDevAuth} className="space-y-4">
+            <form onSubmit={handleApiKeyAuth} className="space-y-4">
               <div className="space-y-2">
-                <label className="text-sm font-medium">Tenant ID</label>
+                <label htmlFor="api-key" className="text-sm font-medium">API Key</label>
+                <Input
+                  id="api-key"
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="vc_live_..."
+                  required
+                  autoComplete="off"
+                />
+              </div>
+              {error ? (
+                <p role="alert" className="text-sm text-destructive">{error}</p>
+              ) : null}
+              <Button type="submit" className="w-full" disabled={submitting}>
+                {submitting ? "Signing in..." : "Sign in with Machine Key"}
+              </Button>
+            </form>
+
+            {devHeaderAuth ? (
+              <form onSubmit={handleDevAuth} className="mt-6 space-y-4 border-t pt-4">
+                <p className="text-sm font-medium">Development header auth</p>
                 <Input
                   value={tenant}
                   onChange={(e) => setTenant(e.target.value)}
                   placeholder="vaulltcore-dev"
-                  required
                 />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Org ID (optional)</label>
                 <Input
                   value={org}
                   onChange={(e) => setOrg(e.target.value)}
                   placeholder="default"
                 />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Project ID (optional)</label>
                 <Input
                   value={project}
                   onChange={(e) => setProject(e.target.value)}
                   placeholder="project_vt_01"
                 />
-              </div>
-              <Button type="submit" className="w-full">
-                Continue with Dev Headers
-              </Button>
-              <p className="text-center text-xs text-muted-foreground">
-                In development mode, tenant identity is set via HTTP headers.
-                <br />
-                Production uses Better Auth session cookies (not yet mounted).
-              </p>
-            </form>
+                <Button type="submit" variant="outline" className="w-full">
+                  Continue with Dev Headers
+                </Button>
+              </form>
+            ) : null}
           </CardContent>
         </Card>
       </div>
