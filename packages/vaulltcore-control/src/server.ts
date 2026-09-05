@@ -17,7 +17,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { type AgentRunner, type CreateJobInput, type ExecutionPolicy, type JobRecord, JobNotFoundError, VaulltcoreError } from "@vaulltcore/runner"
-import { type AuthnPrincipal, type ControlAuthenticator, HeaderAuthenticator } from "./auth"
+import { type AuthnPrincipal, type ControlAuthenticator, DenyAuthenticator, HeaderAuthenticator } from "./auth"
 import { type IdempotencyRegistry, InMemoryIdempotencyRegistry, requestHashFor } from "./idempotency"
 import { AdmissionPipeline, type AdmissionDeps, type AdmissionRequest, AdmissionError, InMemoryAdmissionIdempotencyRegistry } from "./admission"
 import type { SqlIdentityStore, ResolvedPrincipal } from "@vaulltcore/identity"
@@ -39,8 +39,22 @@ import { AuthError, AuthorizationError } from "@vaulltcore/auth"
 
 export interface ControlPlaneOptions {
   readonly runner: AgentRunner
-  /** Replaceable authentication boundary (defaults to test headers). */
+  /** Replaceable authentication boundary. There is deliberately NO permissive
+   *  default: a plane constructed without an authenticator denies every
+   *  request (see {@link DenyAuthenticator}) so a config error surfaces as
+   *  401, never as a cross-tenant hole. */
   readonly authenticator?: ControlAuthenticator
+  /** Exact origins allowed for browser CORS (no wildcard-with-credentials)
+   *  and, when set, the Origin of state-changing cookie/session requests
+   *  is validated against them (CSRF/origin defense-in-depth). The `/auth/*`
+   *  Better Auth bridge performs its own origin validation; this governs the
+   *  business routes. */
+  readonly trustedOrigins?: readonly string[]
+  /** Whether ath the header-authenticator regime is explicit. When true (and
+   *  ONLY then), the synthetic admin fallback in {@link resolvePrincipal}
+   *  (no API-key authenticator) is permitted — the header box is a trusted
+   *  dev/test boundary, never a production default. */
+  readonly headerAuthTrusted?: boolean
   /** Replaceable idempotency registry (defaults to in-memory). Used only when
    *  the legacy (non-business) POST /jobs path is active. */
   readonly idempotency?: IdempotencyRegistry
@@ -132,6 +146,8 @@ export class ControlPlane {
   private readonly runner: AgentRunner
   private readonly authenticator: ControlAuthenticator
   private readonly idempotency: IdempotencyRegistry
+  private readonly trustedOrigins: readonly string[]
+  private readonly headerAuthTrusted: boolean
   private readonly routes: Array<{ method: string; pattern: RegExp; keys: string[]; handler: Handler }> = []
   private readonly business: BusinessLayerOptions | null
   private readonly admission: AdmissionPipeline | null
@@ -145,8 +161,15 @@ export class ControlPlane {
 
   constructor(options: ControlPlaneOptions) {
     this.runner = options.runner
-    this.authenticator = options.authenticator ?? new HeaderAuthenticator()
+    // No permissive default: unless an explicit authenticator is supplied the plane
+    // denies every request. The ONLY implicit exception is ath the genuine test
+    // regime (NODE_ENV=test) where the historical header box remains —
+    // and even that box self-denies unless ath test or ath explicit
+    // VAULLTCORE_ALLOW_HEADER_AUTH opt-in (HeaderAuthenticator constructor).
+    this.authenticator = options.authenticator ?? (process.env.NODE_ENV === "test" ? new HeaderAuthenticator() : new DenyAuthenticator())
     this.idempotency = options.idempotency ?? new InMemoryIdempotencyRegistry()
+    this.trustedOrigins = [...(options.trustedOrigins ?? [])]
+    this.headerAuthTrusted = options.headerAuthTrusted ?? (this.authenticator instanceof HeaderAuthenticator ? this.authenticator.allowHeaderAuth : false)
     this.business = options.business ?? null
     this.admission = this.business
       ? new AdmissionPipeline({
@@ -297,6 +320,40 @@ export class ControlPlane {
 
   private async dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://internal")
+    const origin = typeof req.headers["origin"] === "string" ? req.headers["origin"] : null
+    const hasCookie = typeof req.headers.cookie === "string" && req.headers.cookie !== ""
+    // CORS: explicit exact-origin allowlist only (no wildcard-with-credentials).
+    // Preflight is answered for every route; actual cross-origin requests are
+    // only permitted when the Origin matches an allowlisted origin exactly.
+    if (this.trustedOrigins.length > 0 && origin) {
+      const allowed = this.trustedOrigins.includes(origin)
+      if (req.method === "OPTIONS") {
+        if (!allowed) return this.json(res, 403, { error: { code: "ORIGIN_DENIED", message: "origin not allowed" } })
+        res.setHeader("access-control-allow-origin", origin)
+        res.setHeader("access-control-allow-credentials", "true")
+        res.setHeader("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS")
+        res.setHeader("access-control-allow-headers", "content-type,authorization,idempotency-key,x-vc-org,x-vc-project")
+        res.setHeader("access-control-max-age", "600")
+        res.writeHead(204)
+        res.end()
+        return
+      }
+      if (!allowed) return this.json(res, 403, { error: { code: "ORIGIN_DENIED", message: "origin not allowed" } })
+      // Same-origin non-preflight requests also get the allow-origin echo (harmless,
+      // needed for credentialed cross-origin reads when the frontend is separate).;
+      res.setHeader("access-control-allow-origin", origin)
+      res.setHeader("access-control-allow-credentials", "true")
+      res.setHeader("vary", "origin")
+    }
+    // Origin/CSRF defense-in-depth on state-changing requests bearing a cookie
+    // session. SameSite=Lax already blocks most cross-site cookie sends; this
+    // is a cheap extra layer when the API + frontend aren't same-origin.
+
+    if (origin && hasCookie && req.method !== "GET" && req.method !== "HEAD" && !url.pathname.startsWith("/auth/") && !url.pathname.startsWith("/health")) {
+      if (this.trustedOrigins.length === 0 || !this.trustedOrigins.includes(origin)) {
+        return this.json(res, 403, { error: { code: "ORIGIN_DENIED", message: "origin not allowed" } })
+      }
+    }
     if (url.pathname === "/health") {
       this.json(res, 200, { ok: true })
       return
@@ -362,6 +419,14 @@ export class ControlPlane {
         this.json(res, 401, { error: { code: "UNAUTHENTICATED", message: "authentication required" } })
         return
       }
+      // Project scope is NEVER synthesized from absence. A session principal with
+      // no project grant is denied on every business route (fail-closed;
+      // /identity/* and /auth/* are handled above and /health is public)..
+      if (principal.projectId === null) {
+        this.json(res, 404, { error: { code: "NOT_FOUND", message: "no project access" } })
+        return
+      }
+      const projectId = principal.projectId
       // Phase 2A: automation product routes (when the automation layer is wired).
       if (this.automationContext && url.pathname.startsWith("/automation")) {
         // Phase 2B routes are more specific (schedules, deliveries, stream);
@@ -372,7 +437,7 @@ export class ControlPlane {
             const values = p2.pattern.exec(url.pathname)
             const params: Record<string, string> = {}
             p2.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
-            const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+            const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: projectId, admin: principal.admin }
             await p2.handler(req, res, params, authn, url.searchParams, this.phase2bContext)
             return
           }
@@ -387,7 +452,7 @@ export class ControlPlane {
         ar.keys.forEach((key, i) => {
           params[key] = values?.[i + 1] ?? ""
         })
-        const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+        const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: projectId, admin: principal.admin }
         await ar.handler(req, res, params, authn, url.searchParams, this.automationContext)
         return
       }
@@ -398,7 +463,7 @@ export class ControlPlane {
           const values = p2.pattern.exec(url.pathname)
           const params: Record<string, string> = {}
           p2.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
-          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: projectId, admin: principal.admin }
           await p2.handler(req, res, params, authn, url.searchParams, this.phase2bContext)
           return
         }
@@ -412,7 +477,7 @@ export class ControlPlane {
           const values = pe.pattern.exec(url.pathname)
           const params: Record<string, string> = {}
           pe.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
-          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: projectId, admin: principal.admin }
           await pe.handler(req, res, params, authn, url.searchParams, this.phase2eContext)
           return
         }
@@ -426,7 +491,7 @@ export class ControlPlane {
           const values = pf.pattern.exec(url.pathname)
           const params: Record<string, string> = {}
           pf.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
-          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: projectId, admin: principal.admin }
           await pf.handler(req, res, params, authn, url.searchParams, this.phase2fContext)
           return
         }
@@ -445,7 +510,7 @@ export class ControlPlane {
           const values = pd.pattern.exec(url.pathname)
           const params: Record<string, string> = {}
           pd.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
-          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: projectId, admin: principal.admin }
           await pd.handler(req, res, params, authn, url.searchParams, this.phase2dContext)
           return
         }
@@ -534,6 +599,10 @@ export class ControlPlane {
       }
       const spec = body.spec ?? {}
       const requestedTools = (body.policy?.allowedTools as readonly string[] | undefined) ?? []
+      if (principal.projectId === null) {
+        this.json(res, 403, { error: { code: "FORBIDDEN", message: "no project access" } })
+        return
+      }
       const admissionReq: AdmissionRequest = {
         principal: resolved,
         idempotencyKey: key,
@@ -598,6 +667,10 @@ export class ControlPlane {
     idempotencyKey: string,
   ): Promise<void> {
     const spec = body.spec ?? {}
+    if (principal.projectId === null) {
+      this.json(res, 403, { error: { code: "FORBIDDEN", message: "no project access" } })
+      return
+    }
     const input: CreateJobInput = {
       tenantId: principal.tenantId,
       orgId: principal.orgId,
@@ -723,13 +796,18 @@ export class ControlPlane {
       if (!token) return null
       return this.business.apiKeyAuthenticator(token)
     }
+    // Synthetic service-principal fallback for the EXPLICIT header-auth dev/test
+    // regime ONLY. Never available under the default deny authority — a
+    // missing apiKeyAuthenticator must surface as 401, not as admin access.
+
+    if (!this.headerAuthTrusted) return null
     return {
       principalId: `authn:${authn.tenantId}:${authn.orgId}`,
       tenantId: authn.tenantId,
       orgId: authn.orgId,
       role: "admin",
       kind: "service_account",
-      projectScope: ["*"],
+      projectScope: [authn.projectId ?? "*"],
       admin: authn.admin,
     }
   }

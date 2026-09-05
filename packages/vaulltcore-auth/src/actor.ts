@@ -35,6 +35,10 @@ export interface ResolveInput {
   /** Client-requested organization hint (`x-vc-org`). Validated server-side
    *  against actual membership — never trusted by itself. */
   readonly requestedOrgId?: string
+  /** Socket peer IP (for the opaque device fingerprint). Never logged raw. */
+  readonly ip?: unknown
+  /** Raw User-Agent header (for the opaque device fingerprint; never logged raw). */
+  readonly userAgent?: unknown
 }
 
 export interface ActorResolverDeps {
@@ -55,6 +59,9 @@ export class ActorResolver {
   private readonly sessions?: BetterAuthAdapter
   private readonly serviceIdentities?: ServiceIdentityService
   private readonly audit?: SqlAuditStore
+  /** Opaque sha256(ip|ua) for the CURRENT request — set per resolve(); never
+   *  stored raw IP/UA and never logged。 */
+  private deviceFingerprint: string | undefined
 
   constructor(deps: ActorResolverDeps) {
     this.identity = deps.identity
@@ -70,6 +77,9 @@ export class ActorResolver {
    * (e.g. a requested org the principal is not a member of).
    */
   async resolve(input: ResolveInput): Promise<Actor | null> {
+    const ipv = typeof input.ip === "string" ? input.ip.trim() : ""
+    const uav = typeof input.userAgent === "string" ? input.userAgent.trim() : ""
+    this.deviceFingerprint = ipv !== undefined ? fingerprintSecret(ipv + "|" + uav) : undefined
     const authorization = headerValue(input.authorization)
     const cookie = headerValue(input.cookie)
     if (authorization && authorization.toLowerCase().startsWith("bearer ")) {
@@ -107,8 +117,15 @@ export class ActorResolver {
     const session = await this.sessions!.validateSession(cookie)
     if (!session) return null
     const fingerprint = fingerprintSecret(session.token)
+    const deviceHash = this.deviceFingerprint ?? "unknown"
     try {
-      const record = await this.authStore.getSession(fingerprint)
+      const existing = await this.authStore.getSession(fingerprint)
+      if (existing?.revokedAt) throw new AuthError("SESSION_REVOKED", "session has been revoked")
+      if (existing && existing.userId !== session.userId) {
+
+        throw new AuthError("SESSION_REVOKED", "session registry identity mismatch")
+      }
+      let record = existing
       if (record?.revokedAt) throw new AuthError("SESSION_REVOKED", "session has been revoked")
       if (!record) {
         // First sighting: register the fingerprint for the revocation ledger.
@@ -122,12 +139,56 @@ export class ActorResolver {
         await this.authStore.provisionUserIdentity(session.userId, null)
       }
       const memberships = await this.identity.listMembershipsByPrincipal(session.userId)
-      if (memberships.length === 0) throw new AuthError("ORG_NOT_MEMBER", "user has no organization membership")
+      if (memberships.length === 0) {
+        // Authenticated-but-unmembered human (B7): zero org context. Every
+        // org-scoped route still 404s (sameOrg on ""), so this is honest
+        // "belong nowhere" — never a permissive default. It exists solely
+        // so /identity/invitations/accept can run;accept binds the invitee
+        // to THE INVITATION's home org, never a client choice..
+        return {
+          actorClass: "user",
+          principalId: session.userId,
+          tenantId: "unknown",
+          orgId: "",
+          role: "viewer" as Role,
+          permissions: [],
+          projectScope: [],
+          admin: false,
+          attribution: { userId: session.userId, sessionFingerprint: fingerprint },
+        }
+      }
       const requested = requestedOrgId
       const membership = requested
         ? memberships.find((m) => m.orgId === requested)
         : memberships[0]!
       if (!membership) throw new AuthError("ORG_NOT_MEMBER", `user is not a member of organization ${requested}`)
+      // Tenant/device anchor: pin the registry row to the resolved tenant. A
+      // session pinned to tenant A can never be resolved into tenant B later —
+      // the tie raises a tenant-anchor mismatch denial (suspicious-device class)..
+      // Legacy rows get anchored idempotently (COALESCE), never reset。
+
+
+
+      // Device-change signal (suspicious-device-style telemetry): the session
+      // was first sighted with a DIFFERENT opaque device fingerprint. This is a
+      // metadata signal — never an authz denial by itself (legit rotation: new
+      // device, new UA, proxy hop)。 It feeds exam/security pipelines only..
+
+      if (record?.deviceHash && this.deviceFingerprint && record.deviceHash !== this.deviceFingerprint) {
+
+        void this.audit?.append({
+          type: "session_device_changed",
+          scope: { tenantId: membership.tenantId, orgId: membership.orgId },
+          actor: { principalId: session.userId, kind: "user", tenantId: membership.tenantId },
+          metadata: { code: "SESSION_DEVICE_CHANGED" },
+        }).catch(() => undefined)
+      }
+      record = await this.authStore.tieSessionAnchors(fingerprint, membership.tenantId, deviceHash).catch(() => record ?? null)
+      if (record?.tenantId && record.tenantId !== membership.tenantId) {
+
+
+        throw new AuthError("SESSION_REVOKED", "session tenant anchor mismatch")
+      }
       const resolved = await this.identity.resolvePrincipal(membership.principalId, membership.orgId, membership.role)
       const actor = this.fromResolvedPrincipal(resolved)
       // Best-effort last-seen metadata; never an authz input.

@@ -59,6 +59,34 @@ export interface OrganizationMember {
   readonly createdAt: number
 }
 
+export type InvitationStatus = "pending" | "accepted" | "revoked" | "expired"
+
+/** A durable organization invitation. The token itself is one-time, expiring,
+  *  org-bound, role-frozen and emailed to `email`; only SHA-256 of the
+  *  token is stored. Ownership: acceptance requires possession of the token
+  *  AND, when the platform can verify the arriving user's email, that email
+  *  must match the invite — no silent hijack on an email string alone..
+  */
+export interface OrgInvitation {
+  readonly tenantId: string
+  readonly orgId: string
+  readonly invitationId: string
+  readonly email: string
+  readonly role: Role
+  readonly invitedBy: string
+  readonly status: InvitationStatus
+  readonly createdAt: number
+  readonly expiresAt: number
+  readonly acceptedAt: number | null
+  readonly acceptedBy: string | null
+  readonly revokedAt: number | null
+}
+
+/** Plaintext token emitted exactly once at creation. */
+export interface CreatedInvitation extends OrgInvitation {
+  readonly token: string
+}
+
 /** Optional per-project grant narrowing a member's access. */
 export interface ProjectGrant {
   readonly tenantId: string

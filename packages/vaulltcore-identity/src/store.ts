@@ -20,6 +20,9 @@ import {
   ADMIN_ROLES,
   type ApiKeyRecord,
   type CreatedApiKey,
+  type CreatedInvitation,
+  type InvitationStatus,
+  type OrgInvitation,
   type Organization,
   type OrganizationMember,
   type PrincipalKind,
@@ -31,6 +34,51 @@ import {
   IdentityError,
   ROLE_RANK,
 } from "./contracts"
+
+const INVITATION_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase()
+}
+
+function invitationTokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex")
+}
+
+interface InvitationRow {
+  tenant_id: string
+  org_id: string
+  invitation_id: string
+  email: string
+  role: string
+  invited_by: string
+  status: string
+  token_hash: string
+  idempotency_key: string | null
+  created_at: number
+  expires_at: number
+  accepted_at: number | null
+  accepted_by: string | null
+  revoked_at: number | null
+}
+
+function toInvitation(row: InvitationRow): OrgInvitation {
+
+  return {
+    tenantId: row.tenant_id,
+    orgId: row.org_id,
+    invitationId: row.invitation_id,
+    email: row.email,
+    role: row.role as Role,
+    invitedBy: row.invited_by,
+    status: row.status as InvitationStatus,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    acceptedAt: row.accepted_at,
+    acceptedBy: row.accepted_by,
+    revokedAt: row.revoked_at,
+  }
+}
 
 export const IDENTITY_MIGRATIONS: readonly Migration[] = [
   {
@@ -115,6 +163,36 @@ export const IDENTITY_MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE api_keys ADD COLUMN rotated_from TEXT`,
       `ALTER TABLE api_keys ADD COLUMN overlap_expires_at INTEGER`,
       `CREATE INDEX api_keys_rotated_from_idx ON api_keys (rotated_from)`,
+    ],
+  },
+  {
+    // Phase 2G/B6: durable organization invitations. Tokens are one-time,
+    // expiring, org-bound and role-frozen; only SHA-256 of the plaintext token
+    // is stored (acceptance re-hashes the presented token). `status` is
+    // CHECK-constrained; a pending row for (tenant, org, email) is unique
+    // so duplicate invites collapse idempotently..
+    version: 13,
+    name: "org_invitations",
+    statements: [
+      `CREATE TABLE org_invitations (
+        tenant_id      TEXT NOT NULL,
+        org_id         TEXT NOT NULL,
+        invitation_id  TEXT PRIMARY KEY,
+        email          TEXT NOT NULL,
+        role           TEXT NOT NULL,
+        invited_by      TEXT NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'pending',
+        token_hash     TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT,
+        created_at     INTEGER NOT NULL,
+        expires_at     INTEGER NOT NULL,
+        accepted_at    INTEGER,
+        accepted_by    TEXT,
+        revoked_at     INTEGER,
+        UNIQUE (tenant_id, org_id, email, status)
+      )`,
+      `CREATE INDEX org_invitations_org_idx ON org_invitations (tenant_id, org_id)`,
+      `CREATE INDEX org_invitations_lookup_idx ON org_invitations (token_hash, status)`,
     ],
   },
 ]
@@ -334,6 +412,102 @@ export class SqlIdentityStore extends SqlStoreBase {
     return rows.map((row) => ({ tenantId: row.tenant_id, orgId: row.org_id, principalId: row.principal_id, role: row.role as Role, createdAt: row.created_at }))
   }
 
+// -----------------------------------------------------------------------
+  // Organization invitations (durable, one-time, org-bound, role-frozen)
+  // -----------------------------------------------------------------------
+  async createInvitation(tenantId: string, orgId: string, input: { email: string; role: Role; invitedBy: string; expiresInMs?: number; idempotencyKey?: string }): Promise<CreatedInvitation> {
+    if (!(await this.getOrganization(tenantId, orgId))) throw new IdentityError("ORG_NOT_FOUND", `Organization ${orgId} not found in tenant ${tenantId}`)
+    const email = normalizeEmail(input.email)
+    if (!email) throw new IdentityError("INVALID_INPUT", "invitation email is required")
+    const pending = this.prepare("SELECT 1 FROM org_invitations WHERE tenant_id = ? AND org_id = ? AND email = ? AND status = 'pending'").get(tenantId, orgId, email)
+    if (pending) {
+      throw new IdentityError("INVITATION_PENDING", "an invitation for this email is already pending")
+    }
+    const invitationId = randomBytes(16).toString("hex")
+    const token = randomBytes(32).toString("hex")
+    const now = Date.now()
+    const expiresAt = now + (input.expiresInMs ?? INVITATION_DEFAULT_TTL_MS)
+    this.atomic("createInvitation", () =>
+      this.prepare("INSERT INTO org_invitations (tenant_id, org_id, invitation_id, email, role, invited_by, status, token_hash, idempotency_key, created_at, expires_at, accepted_at, accepted_by, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL, NULL, NULL)").run(tenantId, orgId, invitationId, email, input.role, input.invitedBy, invitationTokenHash(token), input.idempotencyKey ?? null, now, expiresAt),
+    )
+    return { tenantId, orgId, invitationId, email, role: input.role, invitedBy: input.invitedBy, status: "pending", createdAt: now, expiresAt, acceptedAt: null, acceptedBy: null, revokedAt: null, token }
+  }
+
+  async listInvitations(tenantId: string, orgId: string): Promise<OrgInvitation[]> {
+    const rows = this.prepare("SELECT * FROM org_invitations WHERE tenant_id = ? AND org_id = ? ORDER BY created_at DESC").all(tenantId, orgId) as unknown as InvitationRow[]
+    return rows.map(toInvitation)
+  }
+
+  async revokeInvitation(tenantId: string, orgId: string, invitationId: string): Promise<OrgInvitation | null> {
+
+    const result = this.atomic("revokeInvitation", () =>
+      this.prepare("UPDATE org_invitations SET status = 'revoked', revoked_at = ? WHERE tenant_id = ? AND org_id = ? AND invitation_id = ? AND status = 'pending'").run(Date.now(), tenantId, orgId, invitationId),
+    )
+    if (result.changes === 0) return null
+    const row = this.prepare("SELECT * FROM org_invitations WHERE tenant_id = ? AND org_id = ? AND invitation_id = ?").get(tenantId, orgId, invitationId) as unknown as InvitationRow | undefined
+    return row ? toInvitation(row) : null
+  }
+
+  async getInvitationByToken(token: string): Promise<OrgInvitation | null> {
+
+    const row = this.prepare("SELECT * FROM org_invitations WHERE token_hash = ?").get(invitationTokenHash(token)) as unknown as InvitationRow | undefined
+    return row ? toInvitation(row) : null
+  }
+
+  /** Consume an invitation. Validation: token possession + pending + not
+  *  expired + (when the platform can verify the arriving user's email) email
+  *  ownership must match. The membership is ALWAYS pinned to the invitation's
+  *  home tenant/org — never a client-supplied tenant.. */
+  async acceptInvitation(input: { token: string; principalId: string; verifiedEmail: string | null }): Promise<OrganizationMember> {
+    const row = await this.getInvitationByToken(input.token)
+    if (!row || row.status !== "pending") throw new IdentityError("INVITATION_NOT_FOUND", "invitation not found or already consumed")
+    if (row.expiresAt < Date.now()) {
+      await this.markInvitationExpired(row)
+      throw new IdentityError("INVITATION_EXPIRED", "invitation has expired")
+    }
+    if (input.verifiedEmail !== null) {
+      const email = normalizeEmail(input.verifiedEmail)
+      if (email !== row.email) {
+        throw new IdentityError("INVITATION_EMAIL_MISMATCH", "invitation email does not match the authenticated user")
+      }
+    }
+    // Consume first (meric) — exactly-once acceptance..
+    const result = this.atomic("acceptInvitation", () =>
+      this.prepare("UPDATE org_invitations SET status = 'accepted', accepted_at = ?, accepted_by = ? WHERE invitation_id = ? AND status = 'pending' AND expires_at >= ?").run(Date.now(), input.principalId, row.invitationId, Date.now()),
+    )
+    if (result.changes === 0) {
+      // Race: another consumer won (or expired between read-and-write).
+      await this.markInvitationExpired(row).catch(() => undefined)
+      throw new IdentityError("INVITATION_ALREADY_CONSUMED", "invitation was consumed by another principal")
+    }
+    // Membership add is OWN atomic — after the durable consume. A crash
+    // between consume and add leaves an accepted-but-unjoined row; the
+    // next accept attempt sees status !pending and surfaces honestlyrather
+    // than silently double-adding..
+    try {
+      await this.registerPrincipal(row.tenantId, input.principalId, "user")
+    } catch (error) {
+      if (!(error instanceof IdentityError && error.code === "PRINCIPAL_EXISTS")) throw error
+    }
+    return this.addMember(row.tenantId, row.orgId, input.principalId, row.role)
+  }
+
+  async expireInvitations(): Promise<number> {
+
+
+
+    const result = this.atomic("expireInvitations", () =>
+      this.prepare("UPDATE org_invitations SET status = 'expired', revoked_at = ? WHERE status = 'pending' AND expires_at < ?").run(Date.now(), Date.now()),
+    )
+    return result.changes
+  }
+
+  private async markInvitationExpired(invitation: OrgInvitation): Promise<void> {
+
+    await this.atomic("markInvitationExpired", () =>
+      this.prepare("UPDATE org_invitations SET status = 'expired', revoked_at = ? WHERE invitation_id = ? AND status = 'pending'").run(Date.now(), invitation.invitationId),
+    )
+  }
   async grantProject(tenantId: string, orgId: string, projectId: string, principalId: string, role: Role): Promise<ProjectGrant> {
     this.atomic("grantProject", () => {
       try {

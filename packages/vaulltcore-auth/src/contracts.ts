@@ -201,6 +201,10 @@ export interface SessionRecord {
   readonly expiresAt: number
   readonly revokedAt: number | null
   readonly lastSeenAt: number | null
+  /** The tenant the session was first anchored to (set on first validation). */
+  readonly tenantId?: string
+  /** sha256(ip|ua) — opaque device fingerprint (set on first validation; never raw IP/UA). */
+  readonly deviceHash?: string
 }
 
 // ---------------------------------------------------------------------------
