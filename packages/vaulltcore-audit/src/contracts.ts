@@ -165,6 +165,17 @@ export const AUDIT_EVENT_TYPES = [
   "invitation_accepted",
   "invitation_revoked",
   "invitation_expired",
+  // Phase 3B (B8): ownership lifecycle. Adding an owner, removing an
+  // owner (when not last), ownership transfer, and role-change denials all
+  // emit durable, sanitized records. `owner_transfer_started` captures the
+  // attempt (actor, from, to); `owner_transfer_completed` confirms the
+  // atomic transition (new owner guaranteed, old owner demoted to admin);
+  // `role_change_denied` surfaces attempted privilege escalations / self-changes
+  // for security monitoring — never the request body, only the resolved actor..
+  "owner_promoted",
+  "owner_transfer_started",
+  "owner_transfer_completed",
+  "role_change_denied",
   "security_notify_sent",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
