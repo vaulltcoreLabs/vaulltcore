@@ -98,9 +98,23 @@ function guard(actor: Actor, permission: Permission): void {
   *  only the org owner may invite/add members. Admins may manage the
   *  org's other settings but cannot mint new membership authority. */
 function requireOwner(actor: Actor): void {
-  // Role check is the gate; the AuthorizationError code is only the transport
+  // Role check is the gate;the AuthorizationError code is only the transport
   // so both compile cleanly and the control plane maps it to 403..
   if (actor.role !== "owner") throw new AuthorizationError("org.manage", "organization owner required")
+}
+
+/**
+ * B8 — OWNER-SENSITIVE ACTIONS REQUIRE A HUMAN SESSION. Owner sovereignty
+ *  decisions (ownership transfer, owner removal, owner demotion) must not
+ *  be executable by a leaked machine credential with an owner-scoped member role:
+ *  automation cannot transfer or delete human organizational authority. Only a
+ *  Better Auth session (actor class "user") may perform them. This is NOT a
+ *  second auth model — it narrows which actor classes may cross the ownership
+ *  boundary, preserving the Phase-1E role-rank permission contract..
+ */
+function requireOwnerHuman(actor: Actor): void {
+  requireOwner(actor)
+  if (actor.actorClass !== "user") throw new AuthorizationError("org.manage", "ownership actions require a human session")
 }
 
 /** Org scoping guard: a route path org must match the validated actor org —
@@ -220,8 +234,8 @@ async function upsertMember(req: IncomingMessage, res: ServerResponse, params: R
       }
       throw error
     }
-    auditAction(ctx, actor, "invitation_created", { invitationId: created.invitationId, orgId: params.orgId!, role: created.role })
-    ctx.json(res, 201, { invitation: { invitationId: created.invitationId, orgId: created.orgId, email: created.email, role: created.role, expiresAt: created.expiresAt, status: created.status }, token: created.token })
+        auditAction(ctx, actor, "invitation_created", { invitationId: created.invitationId, orgId: params.orgId!, role: created.role, replayed: "token" in created })
+    ctx.json(res, "token" in created ? 201 : 200, { invitation: { invitationId: created.invitationId, orgId: created.orgId, email: created.email, role: created.role, expiresAt: created.expiresAt, status: created.status }, ...("token" in created ? { token: (created as unknown as { token: string }).token } : { replayed: true }) })
   }
 
   async function listInvitations(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
@@ -249,8 +263,8 @@ async function upsertMember(req: IncomingMessage, res: ServerResponse, params: R
     await ctx.identity.revokeInvitation(actor.tenantId, params.orgId!, old.invitationId!)
     auditAction(ctx, actor, "invitation_revoked", { invitationId: old.invitationId!, orgId: params.orgId! })
     const created = await ctx.identity.createInvitation(actor.tenantId, params.orgId!, { email: old.email, role: old.role, invitedBy: actor.principalId, idempotencyKey: undefined })
-    auditAction(ctx, actor, "invitation_created", { invitationId: created.invitationId, orgId: params.orgId!, role: created.role })
-    ctx.json(res, 201, { invitation: { invitationId: created.invitationId, orgId: created.orgId, email: created.email, role: created.role, expiresAt: created.expiresAt, status: created.status }, token: created.token })
+        auditAction(ctx, actor, "invitation_created", { invitationId: created.invitationId, orgId: params.orgId!, role: created.role, replayed: "token" in created })
+    ctx.json(res, "token" in created ? 201 : 200, { invitation: { invitationId: created.invitationId, orgId: created.orgId, email: created.email, role: created.role, expiresAt: created.expiresAt, status: created.status }, ...("token" in created ? { token: (created as unknown as { token: string }).token } : { replayed: true }) })
   }
 
   async function acceptInvitation(req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
@@ -282,13 +296,34 @@ async function changeMemberRole(req: IncomingMessage, res: ServerResponse, param
   guard(actor, "member.manage")
   const body = await ctx.readBody(req)
   const role = typeof body.role === "string" ? body.role : null
-  if (!role || !(ROLES as readonly string[]).includes(role)) {
-    return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: `unknown role ${JSON.stringify(body.role)}` } })
+  if (!role || !ROLES.includes(role as Role)) {
+    return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: `unknown role "${String(body.role)}"` } })
+  }
+  // B8 — BEFORE looking up the target, deny self-role-changes: an actor must
+  // never be able to modify their OWN role (owner or otherwise) by submitting
+  // {role: X} — server-side resolution is the only authority..
+  // Role changes are always performed BY a different authorized actor..
+  if (params.principalId! === actor.principalId) {
+    auditAction(ctx, actor, "role_change_denied", { principalId: actor.principalId, reason: "self_role_change", from: null, to: role })
+    return ctx.json(res, 403, { error: { code: "FORBIDDEN", message: "you cannot change your own role" } })
   }
   const member = await ctx.identity.getMember(actor.tenantId, params.orgId!, params.principalId!)
   if (!member) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "member not found" } })
-  await ctx.identity.setMemberRole(actor.tenantId, params.orgId!, params.principalId!, role as Role)
-  auditAction(ctx, actor, "member_role_changed", { principalId: params.principalId!, from: member.role, to: role })
+  // Owner transitions are owner-only even though member.manage would admit an
+  // admin: granting owner authority (or touching an existing owner's role)) is an
+  // ownership-sovereignty decision, not a delegated management one..
+  if (role === "owner" || member.role === "owner") requireOwnerHuman(actor)
+  try {
+    await ctx.identity.setMemberRole(actor.tenantId, params.orgId!, params.principalId!, role as Role)
+  } catch (error) {
+    if (error instanceof IdentityError && (error.code === "LAST_OWNER" || error.code === "MEMBER_NOT_FOUND")) {
+      if (error.code === "MEMBER_NOT_FOUND") return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "member not found" } })
+      return ctx.json(res, 409, { error: { code: "LAST_OWNER", message: "the last owner cannot be demoted; transfer ownership first" } })
+    }
+    throw error
+  }
+  auditAction(ctx, actor, "member_role_changed", { principalId: params.principalId!,from: member.role,to: role,ownerAction: role === "owner" || member.role === "owner" })
+  if (role === "owner") auditAction(ctx, actor, "owner_promoted", { principalId: params.principalId!,from: member.role })
   ctx.json(res, 200, { principalId: params.principalId!, role })
 }
 
@@ -297,9 +332,46 @@ async function removeMember(_req: IncomingMessage, res: ServerResponse, params: 
   guard(actor, "member.manage")
   const member = await ctx.identity.getMember(actor.tenantId, params.orgId!, params.principalId!)
   if (!member) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "member not found" } })
-  await ctx.identity.removeMember(actor.tenantId, params.orgId!, params.principalId!)
-  auditAction(ctx, actor, "member_removed", { principalId: params.principalId! })
+  // B8 — removing (or demoting) an OWNER is an ownership-sovereignty decision:
+  // only a HUMAN owner may perform it; when the target is a non-owner, an
+  // admin (member.manage) may remove them. A member may always remove
+  // themselves (leaving) subject to the last-owner invariant..
+  const isSelf = params.principalId! === actor.principalId
+  const isOwnerTarget = member.role === "owner"
+  if (isOwnerTarget && !isSelf) requireOwnerHuman(actor)
+  if (isOwnerTarget && isSelf) requireOwner(actor)
+  try {
+    await ctx.identity.removeMember(actor.tenantId, params.orgId!, params.principalId!)
+  } catch (error) {
+    if (error instanceof IdentityError && error.code === "LAST_OWNER") {
+      return ctx.json(res, 409, { error: { code: "LAST_OWNER", message: "the last owner cannot remove themselves; transfer ownership first" } })
+    }
+    throw error
+  }
+  auditAction(ctx, actor, "member_removed", { principalId: params.principalId!,removedRole: member.role,self: isSelf })
   ctx.json(res, 200, { removed: true })
+}
+
+async function transferOwnership(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
+  if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
+  requireOwnerHuman(actor)
+  const body = await ctx.readBody(req)
+  const toPrincipalId = typeof body?.toPrincipalId === "string" ? body.toPrincipalId : null
+  if (!toPrincipalId || toPrincipalId == "") return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: "toPrincipalId is required" } })
+  if (toPrincipalId === actor.principalId) {
+    auditAction(ctx, actor, "owner_transfer_started", { reason: "self_transfer", toPrincipalId })
+    return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: "ownership transfer requires a different target member" } })
+  }
+  try {
+    const { from, to } = await ctx.identity.transferOwnership(actor.tenantId, params.orgId!, actor.principalId!, toPrincipalId)
+    auditAction(ctx, actor, "owner_transfer_completed", { fromPrincipalId: from.principalId, toPrincipalId: to.principalId, fromRole: from.role, toRole: to.role })
+    ctx.json(res, 200, { from: { principalId: from.principalId, role: from.role }, to: { principalId: to.principalId, role: to.role } })
+  } catch (error) {
+    if (error instanceof IdentityError && (error.code === "MEMBER_NOT_FOUND" || error.code === "OWNER_TRANSFER_INVALID")) {
+      return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: "the target must bean existing non-self member of this organization" } })
+    }
+    throw error
+  }
 }
 
 async function createServiceIdentity(req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
@@ -457,7 +529,8 @@ export const PHASE2G_ROUTES: readonly Phase2gRoute[] = [
   route("POST", "/identity/orgs/:orgId/members", upsertMember),
   route("PATCH", "/identity/orgs/:orgId/members/:principalId", changeMemberRole),
   route("DELETE", "/identity/orgs/:orgId/members/:principalId", removeMember),
-route("POST", "/identity/orgs/:orgId/invitations", createInvitation),
+  route("POST", "/identity/orgs/:orgId/members/transfer-ownership", transferOwnership),
+  route("POST", "/identity/orgs/:orgId/invitations", createInvitation),
   route("GET", "/identity/orgs/:orgId/invitations", listInvitations),
   route("POST", "/identity/orgs/:orgId/invitations/:invitationId/resend", resendInvitation),
   route("POST", "/identity/orgs/:orgId/invitations/:invitationId/revoke", revokeInvitation),

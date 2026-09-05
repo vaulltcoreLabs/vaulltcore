@@ -239,6 +239,9 @@ describe("central permission authorization", () => {
     const rig = makeRig()
     await rig.ba.migrate()
     await seedScope(rig)
+    // a second, background owner exists so kate's promotion/demotion dance
+    // never trips the B8 last-owner invariant (owners-after >= 1..
+    await join(rig, "b8-background-owner@example.com", "owner")
     const { userId, cookie } = await signUp(rig, "kate@example.com")
     await join(rig, userId, "viewer")
     let actor = await rig.resolver.resolve({ cookie })

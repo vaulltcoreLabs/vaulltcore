@@ -362,3 +362,72 @@ describe("organization invitations (B6/B7)", () => {
     expect(newAccept.status).toBe(201)
   })
 })
+
+
+describe("B8 last-owner + ownership transfer + idempotent invitation replay", () => {
+  it("last owner cannot be removed or demoted through HTTP; owner transfer is atomic", async () => {
+    const rig = await serve()
+    const owner = await signUp(rig, "b8-owner@example.com")
+    await joinAsOwner(rig, owner.userId)
+    const admin = await signUp(rig, "b8-admin@example.com")
+    await rig.identity.registerPrincipal(rig.tenantId, admin.userId, "user").catch(() => undefined)
+    await rig.identity.addMember(rig.tenantId, rig.orgId, admin.userId, "admin")
+    // Last-owner protections: an admin cannot demote an owner (403 authorization,
+    // and the owner cannot abandon alone (409 last-owner invariant).
+    const demote = await json(rig.base, "PATCH", "/identity/orgs/org-acme/members/" + owner.userId, { cookie: admin.cookie, body: { role: "admin" } })
+    expect(demote.status).toBe(403)
+    const remove = await json(rig.base, "DELETE", "/identity/orgs/org-acme/members/" + owner.userId, { cookie: owner.cookie })
+    expect(remove.status).toBe(409)
+    // Self-escalation is impossible even with body manipulation..
+    const adminEscalate = await json(rig.base, "PATCH", "/identity/orgs/org-acme/members/" + admin.userId, { cookie: admin.cookie, body: { role: "owner" } })
+    expect(adminEscalate.status).toBe(403)
+    // Owner cannot transfer to self..
+    const selfTransfer = await json(rig.base, "POST", "/identity/orgs/org-acme/members/transfer-ownership", { cookie: owner.cookie, body: { toPrincipalId: owner.userId } })
+    expect(selfTransfer.status).toBe(422)
+    // Atomic transfer: admin becomes owner, old owner demoted to admin.
+
+    const transfer = await json(rig.base, "POST", "/identity/orgs/org-acme/members/transfer-ownership", { cookie: owner.cookie, body: { toPrincipalId: admin.userId } })
+    expect(transfer.status).toBe(200)
+    expect(transfer.body.from.role).toBe("admin")
+    expect(transfer.body.to.role).toBe("owner")
+    // New owner can now remove the old owner (still allowed: org now has >= 1 owner).
+    const removeOld = await json(rig.base, "DELETE", "/identity/orgs/org-acme/members/" + owner.userId, { cookie: admin.cookie })
+    expect(removeOld.status).toBe(200)
+  })
+
+  it("invitation create with the same idempotency key+payload replays once (200) and never re-emits the token", async () => {
+    const rig = await serve()
+    const owner = await signUp(rig, "b8-owner2@example.com")
+    await joinAsOwner(rig, owner.userId)
+    const first = await json(rig.base, "POST", "/identity/orgs/org-acme/invitations", { cookie: owner.cookie, body: { email: "replay@example.com", role: "developer", idempotencyKey: "inv-replay-1" } })
+    expect(first.status).toBe(201)
+    expect(first.body.token).toBeTruthy()
+    const replay = await json(rig.base, "POST", "/identity/orgs/org-acme/invitations", { cookie: owner.cookie, body: { email: "replay@example.com", role: "developer", idempotencyKey: "inv-replay-1" } })
+    expect(replay.status).toBe(200)
+    expect(replay.body.replayed).toBe(true)
+    expect(replay.body.token).toBeUndefined()
+    expect(JSON.stringify(replay.body)).not.toContain(first.body.token)
+    // Same key + different payload is NOT a replay → deterministic 409..
+    const conflict = await json(rig.base, "POST", "/identity/orgs/org-acme/invitations", { cookie: owner.cookie, body: { email: "replay@example.com", role: "viewer", idempotencyKey: "inv-replay-1" } })
+    expect(conflict.status).toBe(409)
+  })
+
+  it("concurrent invitation acceptance collapses to exactly one success (real store, one-time token)", async () => {
+    const rig = await serve()
+    const owner = await signUp(rig, "b8-owner3@example.com")
+    await joinAsOwner(rig, owner.userId)
+    const invitee = await signUp(rig, "b8-invitee@example.com")
+    const created = await json(rig.base, "POST", "/identity/orgs/org-acme/invitations", { cookie: owner.cookie, body: { email: "b8-invitee@example.com", role: "developer" } })
+    expect(created.status).toBe(201)
+    const outcomes = await Promise.all(
+      [
+        json(rig.base, "POST", "/identity/invitations/accept", { cookie: invitee.cookie, body: { token: created.body.token } }),
+        json(rig.base, "POST", "/identity/invitations/accept", { cookie: invitee.cookie, body: { token: created.body.token } }),
+      ],
+    )
+    const ok = outcomes.filter((o) => o.status === 201)
+    expect(ok).toHaveLength(1)
+    const unexpected = outcomes.filter((o: { status: number }) => o.status !== 201 && o.status !== 404)
+    expect(unexpected).toHaveLength(0)
+  })
+})

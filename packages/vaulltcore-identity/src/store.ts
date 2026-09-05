@@ -379,17 +379,95 @@ export class SqlIdentityStore extends SqlStoreBase {
     return { tenantId, orgId, principalId, role, createdAt: now }
   }
 
-  async setMemberRole(tenantId: string, orgId: string, principalId: string, role: Role): Promise<void> {
-    const result = this.atomic("setMemberRole", () =>
-      this.prepare("UPDATE org_members SET role = ? WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").run(role, tenantId, orgId, principalId),
-    )
-    if (result.changes === 0) throw new IdentityError("MEMBER_NOT_FOUND", `Principal ${principalId} is not a member of ${orgId}`)
+  /**
+   * B8 — LAST-OWNER INVARIANT. Changing a member's role must never leave
+   * the organization ownerless. Demoting/removing the LAST owner is rejected
+   * deterministically inside the SAME transaction as the mutation (the SELECT
+   * owner-count + conditional UPDATE share one atomic commit boundary — no
+   * TOCTOU between read and write). `owners_after >= 1` is enforced
+   * unconditionally: the only path that may reduce owner count is an explicit,
+   * separately-designed organization destruction workflow (not present today),,
+   * so an owner demoting/removing themselves is treated exactly like any other
+   * owner reduction — the invariant wins over convenience.
+   */
+  private countOwnersLocked(tenantId: string, orgId: string): number {
+    const rows = this.prepare("SELECT 1 FROM org_members WHERE tenant_id = ? AND org_id = ? AND role = 'owner'").all(tenantId, orgId)
+    return rows.length
   }
 
+  async setMemberRole(tenantId: string, orgId: string, principalId: string, role: Role): Promise<void> {
+    this.atomic("setMemberRole", () => {
+      const row = this.prepare("SELECT * FROM org_members WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").get(tenantId, orgId, principalId) as unknown as MemberRow | undefined
+      if (!row) throw new IdentityError("MEMBER_NOT_FOUND", `Principal ${principalId} is not a member of ${orgId}`)
+      const current = row.role as Role
+      if (role === current) return // no-op idempotent
+      // A demotion out of the owner role must preserve >= 1 owner.
+      // target's current role isn't owner, this is a plain promotion/demotion of
+      // a non-owner — no last-owner concern (adding to owner only helps).
+      if (current === "owner" && role !== "owner") {
+        if (this.countOwnersLocked(tenantId, orgId) < 2) {
+          throw new IdentityError("LAST_OWNER", "the last owner cannot be demoted; transfer ownership first")
+        }
+      }
+      this.prepare("UPDATE org_members SET role = ? WHERE tenant_id = ? AND org_id = ? AND principal_id = ? AND role = ?").run(role, tenantId, orgId, principalId, current)
+      // role CAS: the UPDATE is guarded on the read current value; any lost
+      // update would change 0 rows — but we're the only writer on this
+      // connection inside BEGIN IMMEDIATE, so this is belt-and-braces for dialects
+      // where the read and write could interleave with another committed writer.
+
+    })
+  }
+
+  /** B8 — LAST-OWNER on removal. `owners_after >= 1` unless the row being
+   *  removed isn't an owner. */
   async removeMember(tenantId: string, orgId: string, principalId: string): Promise<void> {
-    this.atomic("removeMember", () =>
-      this.prepare("DELETE FROM org_members WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").run(tenantId, orgId, principalId),
-    )
+    this.atomic("removeMember", () => {
+      const row = this.prepare("SELECT * FROM org_members WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").get(tenantId, orgId, principalId) as unknown as MemberRow | undefined
+      if (!row) return // idempotent no-op
+      const current = row.role as Role
+      if (current === "owner") {
+        if (this.countOwnersLocked(tenantId, orgId) < 2) {
+          throw new IdentityError("LAST_OWNER", "the last owner cannot be removed; transfer ownership first")
+        }
+      }
+      this.prepare("DELETE FROM org_members WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").run(tenantId, orgId, principalId)
+    })
+  }
+
+  /**
+   * B8 — ATOMIC OWNERSHIP TRANSFER. `new owner` is guaranteed to exist
+   * and the `old owner` is demoted ONLY AFTER the new owner write succeeded —
+   * both writes share ONE atomic transaction, so no window ever exists where
+   * the org hase 0 owners. The target must bean existing member of the org
+   * (any role). Ownership transfer to a non-member is rejected (invite-then-
+   * transfer is the supported path). The old owner is demoted to `admin`;
+   * users who want to fully leave must then remove themselves (allowed when not
+   * last owner, or after transfer). The old owner may not transfer to themselves
+   * (that's a no-op; 422 at the control layer, store rejects here for defense).
+   */
+  async transferOwnership(
+    tenantId: string,
+    orgId: string,
+    fromPrincipalId: string,
+    toPrincipalId: string,
+  ): Promise<{ from: OrganizationMember; to: OrganizationMember }> {
+    if (fromPrincipalId === toPrincipalId) throw new IdentityError("OWNER_TRANSFER_INVALID", "ownership transfer requires a different target member")
+    const now = Date.now()
+    return this.atomic("transferOwnership", (): { from: OrganizationMember; to: OrganizationMember } => {
+      const fromRow = this.prepare("SELECT * FROM org_members WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").get(tenantId, orgId, fromPrincipalId) as unknown as MemberRow | undefined
+      if (!fromRow) throw new IdentityError("MEMBER_NOT_FOUND", `Principal ${fromPrincipalId} is not a member of ${orgId}`)
+      if ((fromRow.role as Role) !== "owner") throw new IdentityError("OWNER_TRANSFER_INVALID", "ownership transfer requires the current owner")
+      const toRow = this.prepare("SELECT * FROM org_members WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").get(tenantId, orgId, toPrincipalId) as unknown as MemberRow | undefined
+      if (!toRow) throw new IdentityError("MEMBER_NOT_FOUND", `Principal ${toPrincipalId} is not a member of ${orgId}`)
+      this.prepare("UPDATE org_members SET role = 'owner' WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").run(tenantId, orgId, toPrincipalId)
+
+      this.prepare("UPDATE org_members SET role = 'admin' WHERE tenant_id = ? AND org_id = ? AND principal_id = ?").run(tenantId, orgId, fromPrincipalId)
+
+
+      const from: OrganizationMember = { tenantId, orgId, principalId: fromPrincipalId, role: "admin", createdAt: fromRow.created_at }
+      const to: OrganizationMember = { tenantId, orgId, principalId: toPrincipalId, role: "owner", createdAt: toRow.created_at }
+      return { from, to }
+    })
   }
 
   async getMember(tenantId: string, orgId: string, principalId: string): Promise<OrganizationMember | null> {
@@ -415,25 +493,49 @@ export class SqlIdentityStore extends SqlStoreBase {
 // -----------------------------------------------------------------------
   // Organization invitations (durable, one-time, org-bound, role-frozen)
   // -----------------------------------------------------------------------
-  async createInvitation(tenantId: string, orgId: string, input: { email: string; role: Role; invitedBy: string; expiresInMs?: number; idempotencyKey?: string }): Promise<CreatedInvitation> {
-    if (!(await this.getOrganization(tenantId, orgId))) throw new IdentityError("ORG_NOT_FOUND", `Organization ${orgId} not found in tenant ${tenantId}`)
-    const email = normalizeEmail(input.email)
-    if (!email) throw new IdentityError("INVALID_INPUT", "invitation email is required")
-    const pending = this.prepare("SELECT 1 FROM org_invitations WHERE tenant_id = ? AND org_id = ? AND email = ? AND status = 'pending'").get(tenantId, orgId, email)
-    if (pending) {
-      throw new IdentityError("INVITATION_PENDING", "an invitation for this email is already pending")
-    }
-    const invitationId = randomBytes(16).toString("hex")
-    const token = randomBytes(32).toString("hex")
-    const now = Date.now()
-    const expiresAt = now + (input.expiresInMs ?? INVITATION_DEFAULT_TTL_MS)
-    this.atomic("createInvitation", () =>
-      this.prepare("INSERT INTO org_invitations (tenant_id, org_id, invitation_id, email, role, invited_by, status, token_hash, idempotency_key, created_at, expires_at, accepted_at, accepted_by, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL, NULL, NULL)").run(tenantId, orgId, invitationId, email, input.role, input.invitedBy, invitationTokenHash(token), input.idempotencyKey ?? null, now, expiresAt),
-    )
-    return { tenantId, orgId, invitationId, email, role: input.role, invitedBy: input.invitedBy, status: "pending", createdAt: now, expiresAt, acceptedAt: null, acceptedBy: null, revokedAt: null, token }
-  }
+      /**
+     * B8 — INVITATION CREATION (idempotent when an idempotency key is supplied).
+     * A pending invitation for the same email already exists:
+     *  - with NO idempotency key → deterministic 409 (INVITATION_PENDING — no duplicate).
+     *  - with the SAME idempotency key (and same email+role)→ returns the EXISTING
+     *    pending invitation WITHOUT re-emitting the plaintext token (secret-shown-once
+     *    contract: a replay must not mint a second token/nor resend the old one). A
+     *    NEW key on an already-pending email → 409 like the no-key case (no
+     *    cross-key hijack). The lookup is inside the SAME atomic transaction as the insert,
+     *    so concurrent identical requests collapse deterministically onto one row.
+     */
+    async createInvitation(tenantId: string, orgId: string, input: { email: string; role: Role; invitedBy: string; expiresInMs?: number; idempotencyKey?: string }): Promise<CreatedInvitation | OrgInvitation> {
+      if (!(await this.getOrganization(tenantId, orgId))) throw new IdentityError("ORG_NOT_FOUND", `Organization ${orgId} not found in tenant ${tenantId}`)
+      const email = normalizeEmail(input.email)
+      if (!email) throw new IdentityError("INVALID_INPUT", "invitation email is required")
+      const now = Date.now()
+      return this.atomic("createInvitation", (): CreatedInvitation | OrgInvitation => {
+        const existing = input.idempotencyKey
+          ? this.prepare("SELECT * FROM org_invitations WHERE tenant_id = ? AND org_id = ? AND idempotency_key = ?").get(tenantId, orgId, input.idempotencyKey) as unknown as InvitationRow | undefined
+          : undefined
+        if (existing) {
+          if (existing.status === "pending" && existing.email === email && (existing.role as Role) === input.role) {
+            return toInvitation(existing) // idempotent replay — NO token
+          }
+          throw new IdentityError("INVITATION_PENDING", "an invitation for this email is already pending")
+        }
+        const pending = this.prepare("SELECT 1 FROM org_invitations WHERE tenant_id = ? AND org_id = ? AND email = ? AND status = 'pending' AND expires_at > ?").get(tenantId, orgId, email, now)
+        if (pending) {
+          throw new IdentityError("INVITATION_PENDING", "an invitation for this email is already pending")
+        }
+        // Expired-pending rows are dead: purge them first so a fresh invitation can take
+        // the email slot (also erases their stale token hashes → old-token replay dies.
 
-  async listInvitations(tenantId: string, orgId: string): Promise<OrgInvitation[]> {
+        this.prepare("DELETE FROM org_invitations WHERE tenant_id = ? AND org_id = ? AND email = ? AND status = 'pending' AND expires_at <= ?").run(tenantId, orgId, email, now)
+        const invitationId = randomBytes(16).toString("hex")
+        const token = randomBytes(32).toString("hex")
+        const expiresAt = now + (input.expiresInMs ?? INVITATION_DEFAULT_TTL_MS)
+        this.prepare("INSERT INTO org_invitations (tenant_id, org_id, invitation_id, email, role, invited_by, status, token_hash, idempotency_key, created_at, expires_at, accepted_at, accepted_by, revoked_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL, NULL, NULL)").run(tenantId, orgId, invitationId, email, input.role, input.invitedBy, invitationTokenHash(token), input.idempotencyKey ?? null, now, expiresAt)
+        return { tenantId, orgId, invitationId, email, role: input.role, invitedBy: input.invitedBy, status: "pending", createdAt: now, expiresAt, acceptedAt: null, acceptedBy: null, revokedAt: null, token }
+      })
+    }
+
+async listInvitations(tenantId: string, orgId: string): Promise<OrgInvitation[]> {
     const rows = this.prepare("SELECT * FROM org_invitations WHERE tenant_id = ? AND org_id = ? ORDER BY created_at DESC").all(tenantId, orgId) as unknown as InvitationRow[]
     return rows.map(toInvitation)
   }
@@ -454,45 +556,71 @@ export class SqlIdentityStore extends SqlStoreBase {
     return row ? toInvitation(row) : null
   }
 
-  /** Consume an invitation. Validation: token possession + pending + not
-  *  expired + (when the platform can verify the arriving user's email) email
-  *  ownership must match. The membership is ALWAYS pinned to the invitation's
-  *  home tenant/org — never a client-supplied tenant.. */
+    /** B8 — ATOMIC INVITATION ACCEPTANCE. Consume (conditional UPDATE on
+   *  `status='pending' AND expires_at >= now`), register the principal and add
+   *  the membership are ALL inside ONE atomic transaction — a crash anywhere
+   *  rolls back everything, so no accepted-but-unjoined gap can ever exist
+   *  (fixes the old consume-first-then-add crash window). A stale consumer (or
+   *  an expired-vs-accept race) loses deterministically:the conditional UPDATE
+   *  changes 0 rows when another consumer already consumed the token or the
+   *  expiry passed between read and write. The home-tenant pin rejects a
+   *  principal already bound to a DIFFERENT tenant (identity collision defense:
+   *  never merge a cross-tenant account into this invitation's org). */
   async acceptInvitation(input: { token: string; principalId: string; verifiedEmail: string | null }): Promise<OrganizationMember> {
-    const row = await this.getInvitationByToken(input.token)
-    if (!row || row.status !== "pending") throw new IdentityError("INVITATION_NOT_FOUND", "invitation not found or already consumed")
-    if (row.expiresAt < Date.now()) {
-      await this.markInvitationExpired(row)
-      throw new IdentityError("INVITATION_EXPIRED", "invitation has expired")
-    }
-    if (input.verifiedEmail !== null) {
-      const email = normalizeEmail(input.verifiedEmail)
-      if (email !== row.email) {
-        throw new IdentityError("INVITATION_EMAIL_MISMATCH", "invitation email does not match the authenticated user")
+    const now = Date.now()
+    const nowMs = now
+    return this.atomic("acceptInvitation", (): OrganizationMember => {
+      const row = this.prepare("SELECT * FROM org_invitations WHERE token_hash = ?").get(invitationTokenHash(input.token)) as unknown as InvitationRow | undefined
+
+      if (!row || row.status !== "pending") throw new IdentityError("INVITATION_NOT_FOUND", "invitation not found or already consumed")
+
+      if (row.expires_at < nowMs) throw new IdentityError("INVITATION_EXPIRED", "invitation has expired")
+
+      if (input.verifiedEmail !== null) {
+        const email = normalizeEmail(input.verifiedEmail)
+        if (email !== row.email) {
+          throw new IdentityError("INVITATION_EMAIL_MISMATCH", "invitation email does not match the authenticated user")
+        }
       }
-    }
-    // Consume first (meric) — exactly-once acceptance..
-    const result = this.atomic("acceptInvitation", () =>
-      this.prepare("UPDATE org_invitations SET status = 'accepted', accepted_at = ?, accepted_by = ? WHERE invitation_id = ? AND status = 'pending' AND expires_at >= ?").run(Date.now(), input.principalId, row.invitationId, Date.now()),
-    )
-    if (result.changes === 0) {
-      // Race: another consumer won (or expired between read-and-write).
-      await this.markInvitationExpired(row).catch(() => undefined)
-      throw new IdentityError("INVITATION_ALREADY_CONSUMED", "invitation was consumed by another principal")
-    }
-    // Membership add is OWN atomic — after the durable consume. A crash
-    // between consume and add leaves an accepted-but-unjoined row; the
-    // next accept attempt sees status !pending and surfaces honestlyrather
-    // than silently double-adding..
-    try {
-      await this.registerPrincipal(row.tenantId, input.principalId, "user")
-    } catch (error) {
-      if (!(error instanceof IdentityError && error.code === "PRINCIPAL_EXISTS")) throw error
-    }
-    return this.addMember(row.tenantId, row.orgId, input.principalId, row.role)
+
+      const result = this.prepare("UPDATE org_invitations SET status = 'accepted', accepted_at = ?, accepted_by = ? WHERE invitation_id = ? AND status = 'pending' AND expires_at >= ?").run(nowMs, input.principalId, row.invitation_id, nowMs)
+      if (result.changes === 0) {
+        // Race: another consumer won between the in-txn read and this UPDATE.
+        throw new IdentityError("INVITATION_ALREADY_CONSUMED", "invitation was consumed by another principal")
+      }
+
+      // Home-tenant pin: register the principal idempotently, but REJECT if
+      // already bound to another tenant — a leaking cross-tenant invite can
+      // neither merge accounts nor mint a membership under a foreign tenant..
+      try {
+        this.prepare("INSERT INTO principals (principal_id, tenant_id, kind, created_at) VALUES (?, ?, 'user', ?)").run(input.principalId, row.tenant_id, nowMs)
+
+      } catch (error) {
+        if (isUniqueViolation(error)) {
+          const existing = this.prepare("SELECT tenant_id FROM principals WHERE principal_id = ?").get(input.principalId) as { tenant_id: string } | undefined
+          if (existing && existing.tenant_id !== row.tenant_id) {
+
+
+            throw new IdentityError("INVITATION_TENANT_MISMATCH", "the authenticated principal belongs to another tenant")
+          }
+        } else {
+          throw error
+        }
+      }
+
+      // Membership add inside the SAME transaction — atomic with the consume. A
+      // duplicate membership (already a member) is a deterministic 409.
+      try {
+        this.prepare("INSERT INTO org_members (tenant_id, org_id, principal_id, role, created_at) VALUES (?, ?, ?, ?, ?)").run(row.tenant_id, row.org_id, input.principalId, row.role, nowMs)
+      } catch (error) {
+        if (isUniqueViolation(error)) throw new IdentityError("MEMBER_EXISTS", `Principal ${input.principalId} is already a member of ${row.org_id}`)
+        throw error
+      }
+      return { tenantId: row.tenant_id, orgId: row.org_id, principalId: input.principalId, role: row.role as Role, createdAt: nowMs }
+    })
   }
 
-  async expireInvitations(): Promise<number> {
+async expireInvitations(): Promise<number> {
 
 
 
