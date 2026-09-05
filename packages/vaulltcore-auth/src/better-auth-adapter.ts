@@ -176,6 +176,9 @@ export interface SessionInfo {
   /** Raw session token — used only to compute a fingerprint; never stored/logged. */
   readonly token: string
   readonly expiresAt: number
+  /** Verified user email from Better Auth (authoritative server-side identity
+  *  metadata for flows like invitation acceptance — never a client claim). */
+  readonly email?: string
 }
 
 export interface BridgedResponse {
@@ -447,6 +450,7 @@ export class BetterAuthAdapter {
       sessionId: session.session.id,
       token: session.session.token,
       expiresAt: new Date(session.session.expiresAt).getTime(),
+      email: typeof session.user.email === "string" ? session.user.email : undefined,
     }
   }
 

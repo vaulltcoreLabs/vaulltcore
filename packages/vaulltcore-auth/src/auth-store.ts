@@ -83,6 +83,21 @@ export const B2B_AUTH_MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX session_registry_user_idx ON session_registry (user_id)`,
     ],
   },
+  {
+    // Additive hardening (Phase 2G hardening batch): tenant binding +
+    // hashed device fingerprint enable per-tenant session revocation (disabling
+    // a user in org A never nukes org B sessions of the same Better Auth user)
+    // and suspicious-device detection. device_hash = sha256(ip|ua) — an opaque
+    // fingerprint, never raw IP/UA. Legacy rows get tenant_id/device_hash NULL
+    // (first resolution re-ties them; see SqlB2bAuthStore.tieSessionAnchors).
+    version: 2,
+    name: "b2b_identity_session_anchors",
+    statements: [
+      `ALTER TABLE session_registry ADD COLUMN tenant_id TEXT`,
+      `ALTER TABLE session_registry ADD COLUMN device_hash TEXT`,
+      `CREATE INDEX session_registry_tenant_user_idx ON session_registry (tenant_id, user_id)`,
+    ],
+  },
 ]
 
 interface UserIdentityRow {
@@ -124,6 +139,8 @@ interface SessionRow {
   expires_at: number
   revoked_at: number | null
   last_seen_at: number | null
+  tenant_id: string | null
+  device_hash: string | null
 }
 
 function toUserIdentity(row: UserIdentityRow): UserIdentity {
@@ -175,6 +192,8 @@ function toSessionRecord(row: SessionRow): SessionRecord {
     expiresAt: row.expires_at,
     revokedAt: row.revoked_at,
     lastSeenAt: row.last_seen_at,
+    tenantId: row.tenant_id ?? undefined,
+    deviceHash: row.device_hash ?? undefined,
   }
 }
 
@@ -408,15 +427,17 @@ export class SqlB2bAuthStore extends SqlStoreBase {
   // Session registry (revocation + audit ledger; fingerprints only)
   // -------------------------------------------------------------------------
 
-  async registerSession(input: { fingerprint: string; userId: string; betterAuthSessionId: string; expiresAt: number }): Promise<SessionRecord> {
+  async registerSession(input: { fingerprint: string; userId: string; betterAuthSessionId: string; expiresAt: number; tenantId?: string; deviceHash?: string }): Promise<SessionRecord> {
     const existing = await this.getSession(input.fingerprint)
+
     if (existing) return existing
     try {
       return await this.atomic("registerSession", (): SessionRecord => {
         this.prepare(
-          "INSERT INTO session_registry (fingerprint, user_id, better_auth_session_id, created_at, expires_at, revoked_at, last_seen_at) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
-        ).run(input.fingerprint, input.userId, input.betterAuthSessionId, Date.now(), input.expiresAt)
-        return { fingerprint: input.fingerprint, userId: input.userId, betterAuthSessionId: input.betterAuthSessionId, createdAt: Date.now(), expiresAt: input.expiresAt, revokedAt: null, lastSeenAt: null }
+          "INSERT INTO session_registry (fingerprint, user_id, better_auth_session_id, created_at, expires_at, revoked_at, last_seen_at, tenant_id, device_hash) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+        ).run(input.fingerprint, input.userId, input.betterAuthSessionId, Date.now(), input.expiresAt, input.tenantId ?? null, input.deviceHash ?? null)
+ 
+        return { fingerprint: input.fingerprint, userId: input.userId, betterAuthSessionId: input.betterAuthSessionId, createdAt: Date.now(), expiresAt: input.expiresAt, revokedAt: null, lastSeenAt: null, tenantId: input.tenantId, deviceHash: input.deviceHash }
       })
     } catch (error) {
       if (isUniqueViolation(error)) {
@@ -427,13 +448,41 @@ export class SqlB2bAuthStore extends SqlStoreBase {
     }
   }
 
+  /**
+   * Anchor a legacy (pre-anchor) session row to a tenant + device. Only fills
+   * NULL anchors and only for the fingerprint owner — idempotent. Used at first
+   * validation sighting so existing deployments get anchored without resets.
+
+   */
+  async tieSessionAnchors(fingerprint: string, tenantId: string, deviceHash: string): Promise<SessionRecord | null> {
+    return this.atomic("tieSessionAnchors", (): SessionRecord | null => {
+      const row = this.prepare("SELECT * FROM session_registry WHERE fingerprint = ?").get(fingerprint) as unknown as SessionRow | undefined
+      if (!row) return null
+      const current = toSessionRecord(row)
+      if (current.tenantId && current.tenantId !== tenantId) {
+
+        // A session cannot change tenant mid-life — deny (the registry is per-tenant
+        // anchored). The caller surfaces this as a suspicious-device signal.
+
+        throw new AuthError("SESSION_REVOKED", "session tenant anchor mismatch")
+      }
+      const needsTenant = current.tenantId === undefined || current.tenantId === null
+      const needsDevice = current.deviceHash === undefined || current.deviceHash === null
+      if (!needsTenant && !needsDevice) return current
+      this.prepare("UPDATE session_registry SET tenant_id = COALESCE(tenant_id, ?), device_hash = COALESCE(device_hash, ?) WHERE fingerprint = ?").run(tenantId, deviceHash, fingerprint)
+      return { ...current, tenantId: current.tenantId ?? tenantId, deviceHash: current.deviceHash ?? deviceHash }
+    })
+  }
+
   async getSession(fingerprint: string): Promise<SessionRecord | null> {
     const row = this.prepare("SELECT * FROM session_registry WHERE fingerprint = ?").get(fingerprint) as unknown as SessionRow | undefined
     return row ? toSessionRecord(row) : null
   }
 
-  async listSessionsForUser(userId: string): Promise<SessionRecord[]> {
-    const rows = this.prepare("SELECT * FROM session_registry WHERE user_id = ? ORDER BY created_at ASC").all(userId) as unknown as SessionRow[]
+  async listSessionsForUser(userId: string, tenantId?: string): Promise<SessionRecord[]> {
+    const rows = tenantId
+      ? this.prepare("SELECT * FROM session_registry WHERE user_id = ? AND tenant_id = ? ORDER BY created_at ASC").all(userId, tenantId) as unknown as SessionRow[]
+      : this.prepare("SELECT * FROM session_registry WHERE user_id = ? ORDER BY created_at ASC").all(userId) as unknown as SessionRow[]
     return rows.map(toSessionRecord)
   }
 
@@ -449,7 +498,20 @@ export class SqlB2bAuthStore extends SqlStoreBase {
     })
   }
 
-  /** Revoke every live session of a user (used on user disable). Returns count. */
+  /**
+   * Revoke every live session of a user IN ONE TENANT (used on user disable/
+   * member-removal).. Cross-tenant sessions of the same Better Auth user are
+   * untouched — disabling in org A never nukes org B sessions. Returns count.
+
+   */
+  async revokeSessionsForUserInTenant(userId: string, tenantId: string): Promise<number> {
+    return this.atomic("revokeSessionsForUserInTenant", (): number =>
+      this.prepare("UPDATE session_registry SET revoked_at = ? WHERE user_id = ? AND tenant_id = ? AND revoked_at IS NULL").run(Date.now(), userId, tenantId).changes,
+    )
+  }
+
+  /** Revoke every live session of a user tenant-agnostic (used only when the
+   *  tenant anchor is genuinely unknown — e.g. pre-anchor legacy rows). */
   async revokeAllSessionsForUser(userId: string): Promise<number> {
     return this.atomic("revokeAllSessionsForUser", (): number =>
       this.prepare("UPDATE session_registry SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").run(Date.now(), userId).changes,

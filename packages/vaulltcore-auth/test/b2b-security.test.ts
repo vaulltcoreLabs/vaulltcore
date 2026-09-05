@@ -187,7 +187,13 @@ describe("session → actor resolution", () => {
     await join(rig, userId, "viewer")
     expect(await rig.resolver.resolve({ cookie })).not.toBeNull()
     await rig.identity.removeMember(rig.tenantId, rig.orgId, userId)
-    await expect(rig.resolver.resolve({ cookie })).rejects.toMatchObject({ code: "ORG_NOT_MEMBER" })
+    // B6: the session stays technically valid (revocation is the session registry's
+    // job), but the memberless actor carries ZERO org context — every org-scoped
+    // authorization immediately 404s. No stale privilege;no existence leak.
+    const actor = await rig.resolver.resolve({ cookie })
+    expect(actor).not.toBeNull()
+    expect(actor!.orgId).toBe("")
+    expect(actor!.permissions).toHaveLength(0)
   })
 
   it("privilege downgrade takes effect at the next request (per-request role lookup)", async () => {
@@ -360,5 +366,73 @@ describe("session registry", () => {
     expect(await rig.authStore.revokeAllSessionsForUser(userId)).toBe(1)
     expect(await rig.authStore.revokeAllSessionsForUser(userId)).toBe(0)
     void actor
+  })
+
+  it("resolution anchors the registry row to tenant+device; cross-tenant re-resolution isdenied", async () => {
+    const rig = makeRig()
+    await rig.ba.migrate()
+    await seedScope(rig)
+    const { userId, cookie } = await signUp(rig, "mia@example.com")
+    await join(rig, userId, "viewer")
+    const anchoredByResolver = await rig.resolver.resolve({ cookie, ip: "203.0.113.9", userAgent: "Mozilla/test" })
+    const anchored = await rig.authStore.getSession(anchoredByResolver!.attribution.sessionFingerprint! )
+    expect(anchored?.tenantId).toBe(rig.tenantId)
+    expect(anchored?.deviceHash).toBeTruthy()
+    expect(anchored?.deviceHash).not.toBe("unknown")
+    // Same Better Auth session, same devicet, requested org still resolves.
+
+    await rig.resolver.resolve({ cookie, ip: "203.0.113.9", userAgent: "Mozilla/test" })
+    // Same session, DIFFERENT devicet, still resolves (device-change is a metadata
+    // signal, never an authz denial), but NOW the tenant anchor is aprendizioned—
+    // cross-org can no longer ride this fingerprint..
+    await rig.identity.createTenant("t-other", "system", "Other Co")
+    await rig.identity.createOrganization("t-other", "org-other", "Other")
+    await rig.identity.registerPrincipal("t-other", userId, "user").catch(() => undefined)
+    await rig.identity.addMember("t-other", "org-other", userId, "viewer")
+    await expect(rig.resolver.resolve({ cookie, requestedOrgId: "org-other" })).rejects.toMatchObject({ code: "SESSION_REVOKED" })
+  })
+
+  it("registry identity mismatch (leaked fingerprint from another user) is denied", async () => {
+    const rig = makeRig()
+    await rig.ba.migrate()
+    await seedScope(rig)
+    const { userId, cookie } = await signUp(rig, "mia@example.com")
+    await join(rig, userId, "viewer")
+    // Pre-seed the registry row with the WRONG user bound to this fingerprint —
+    // exactly the leakage scenario a stolen cookie/token must not survive..
+    // The registry fingerprint follows the RESOLVER's derivation (the validated
+    // Better Auth session token), NOT a raw cookie guess..
+    const validated = await rig.ba.validateSession(cookie)
+    const token = validated!.token
+    await rig.authStore.registerSession({ fingerprint: fingerprintSecret(token), userId: "intruder-user", betterAuthSessionId: "sess-x", expiresAt: Date.now() + 60_000 })
+    await expect(rig.resolver.resolve({ cookie })).rejects.toMatchObject({ code: "SESSION_REVOKED" })
+  })
+
+  it("tenant-scoped revocation leaves other-tenant sessions untouched", async () => {
+    const rig = makeRig()
+    await rig.ba.migrate()
+    await seedScope(rig)
+    const { userId, cookie } = await signUp(rig, "mia@example.com")
+    await join(rig, userId, "viewer")
+    await rig.resolver.resolve({ cookie })
+    expect(await rig.authStore.revokeSessionsForUserInTenant(userId, "t-other")).toBe(0)
+    expect(await rig.authStore.revokeSessionsForUserInTenant(userId, rig.tenantId)).toBe(1)
+    // Fingerprint is revoked incoming — a fresh resolution now DENIES..
+    await expect(rig.resolver.resolve({ cookie })).rejects.toMatchObject({ code: "SESSION_REVOKED" })
+  })
+
+  it("transient device change emits an auditable security signal (no secrets)", async () => {
+    const rig = makeRig()
+    await rig.ba.migrate()
+    await seedScope(rig)
+    const { userId, cookie } = await signUp(rig, "mia@example.com")
+    await join(rig, userId, "viewer")
+    await rig.resolver.resolve({ cookie, ip: "203.0.113.9", userAgent: "Mozilla/A" })
+    const events = await rig.audit.list({ tenantId: rig.tenantId }, 100)
+    expect(events.some((e) => e.type === "session_device_changed")).toBe(false)
+    await rig.resolver.resolve({ cookie, ip: "198.51.100.7", userAgent: "Chrome/B" })
+    const after = await rig.audit.list({ tenantId: rig.tenantId }, 100)
+    expect(after.some((e) => e.type === "session_device_changed" && e.metadata.code === "SESSION_DEVICE_CHANGED")).toBe(true)
+    expect(JSON.stringify(after)).not.toContain("198.51.100.7")
   })
 })

@@ -43,12 +43,15 @@ async function resolveActor(
     authorization: req.headers["authorization"],
     cookie: req.headers["cookie"],
     requestedOrgId: req.headers["x-vc-org"] as string | undefined,
+    ip: req.socket?.remoteAddress,
+    userAgent: req.headers["user-agent"],
   })
   if (!actor) return null
   // Map the actor to the legacy AuthnPrincipal shape (tenant/org/project/admin),the
   // backend authorization is STILL authoritative — the UI cannot widen scope.
-
-  return { tenantId: actor.tenantId, orgId: actor.orgId, projectId: actor.projectScope[0] ?? "*", admin: actor.admin }
+  // Project scope is NEVER synthesized from absence: no grant ⇒ null project
+  // (legacy routes must treat null as no-project access, not as org-wide).”.
+  return { tenantId: actor.tenantId, orgId: actor.orgId, projectId: actor.projectScope.length > 0 ? actor.projectScope[0]! : null, admin: actor.admin }
 }
 
 /** Production fallback authenticator when no session layer (phase2g) is
@@ -334,6 +337,8 @@ async function main(): Promise<void> {
       store: automationStore,
     },
     authenticator: resolver ? { authenticate: (req) => resolveActor(req, resolver) } : apiKeyAuthenticator((secret) => identity.authenticateApiKey(secret)),
+    ...((process.env.AUTH_TRUSTED_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean).length ? { trustedOrigins: (process.env.AUTH_TRUSTED_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean) } : {}),
+    headerAuthTrusted: false,
     phase2b: {
       schedulerStore,
       opsStore,

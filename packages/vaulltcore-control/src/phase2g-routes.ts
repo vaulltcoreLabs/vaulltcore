@@ -94,6 +94,15 @@ function guard(actor: Actor, permission: Permission): void {
   authorize(actor, permission)
 }
 
+/** Organization membership creation is an ownership decision (Phase B6):
+  *  only the org owner may invite/add members. Admins may manage the
+  *  org's other settings but cannot mint new membership authority. */
+function requireOwner(actor: Actor): void {
+  // Role check is the gate; the AuthorizationError code is only the transport
+  // so both compile cleanly and the control plane maps it to 403..
+  if (actor.role !== "owner") throw new AuthorizationError("org.manage", "organization owner required")
+}
+
 /** Org scoping guard: a route path org must match the validated actor org —
  *  cross-tenant access is denied BEFORE resource disclosure (404, no leak). */
 function sameOrg(actor: Actor, orgId: string): boolean {
@@ -151,7 +160,7 @@ async function listMembers(_req: IncomingMessage, res: ServerResponse, params: R
 
 async function upsertMember(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
   if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
-  guard(actor, "member.manage")
+  requireOwner(actor)
   const body = await ctx.readBody(req)
   const principalId = typeof body.userId === "string" ? body.userId : typeof body.principalId === "string" ? body.principalId : null
   const role = typeof body.role === "string" ? body.role : null
@@ -185,6 +194,89 @@ async function upsertMember(req: IncomingMessage, res: ServerResponse, params: R
   ctx.json(res, 201, { principalId, role: member.role, projects })
 }
 
+// -------------------------------------------------------------------------
+  // Organization invitations (B6/B7: owner-only issuance; one-time accept,
+  //  email-ownership when verifiable; token emitted exactly once))
+  // -------------------------------------------------------------------------
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+  async function createInvitation(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
+    if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
+    requireOwner(actor)
+    const body = await ctx.readBody(req)
+    const email = typeof body.email === "string" ? body.email.trim() : ""
+    const role = typeof body.role === "string" ? body.role : ""
+    if (!EMAIL_RE.test(email)) return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: "valid email required" } })
+    if (!role || !ROLES.includes(role as Role)) {
+      return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: `unknown role "${role}"` } })
+    }
+    const expiresInMs = typeof body.expiresInMs === "number" && Number.isFinite(body.expiresInMs) ? body.expiresInMs : undefined
+    let created: Awaited<ReturnType<SqlIdentityStore["createInvitation"]>>
+    try {
+      created = await ctx.identity.createInvitation(actor.tenantId, params.orgId!, { email, role: role as Role, invitedBy: actor.principalId, expiresInMs, idempotencyKey: typeof body.idempotencyKey === "string" ? body.idempotencyKey : undefined })
+    } catch (error) {
+      if (error instanceof IdentityError && error.code === "INVITATION_PENDING") {
+        return ctx.json(res, 409, { error: { code: "INVITATION_PENDING", message: "an invitation for this email is already pending" } })
+      }
+      throw error
+    }
+    auditAction(ctx, actor, "invitation_created", { invitationId: created.invitationId, orgId: params.orgId!, role: created.role })
+    ctx.json(res, 201, { invitation: { invitationId: created.invitationId, orgId: created.orgId, email: created.email, role: created.role, expiresAt: created.expiresAt, status: created.status }, token: created.token })
+  }
+
+  async function listInvitations(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
+    if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
+    guard(actor, "member.manage")
+    const invitations = await ctx.identity.listInvitations(actor.tenantId, params.orgId!)
+    ctx.json(res, 200, { invitations: invitations.map((inv) => ({ invitationId: inv.invitationId, orgId: inv.orgId, email: inv.email, role: inv.role, status: inv.status, createdAt: inv.createdAt, expiresAt: inv.expiresAt, acceptedAt: inv.acceptedAt, revokedAt: inv.revokedAt })) })
+  }
+
+  async function revokeInvitation(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
+    if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
+    requireOwner(actor)
+    const revoked = await ctx.identity.revokeInvitation(actor.tenantId, params.orgId!, params.invitationId!)
+    if (!revoked) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "invitation not found or not pending" } })
+    auditAction(ctx, actor, "invitation_revoked", { invitationId: params.invitationId!, orgId: params.orgId! })
+    ctx.json(res, 200, { revoked: true })
+  }
+
+  async function resendInvitation(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
+    if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
+    requireOwner(actor)
+    const existing = await ctx.identity.listInvitations(actor.tenantId, params.orgId!)
+    const old = existing.find((inv) => inv.invitationId === params.invitationId! && inv.status === "pending")
+    if (!old) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "invitation not found or not pending" } })
+    await ctx.identity.revokeInvitation(actor.tenantId, params.orgId!, old.invitationId!)
+    auditAction(ctx, actor, "invitation_revoked", { invitationId: old.invitationId!, orgId: params.orgId! })
+    const created = await ctx.identity.createInvitation(actor.tenantId, params.orgId!, { email: old.email, role: old.role, invitedBy: actor.principalId, idempotencyKey: undefined })
+    auditAction(ctx, actor, "invitation_created", { invitationId: created.invitationId, orgId: params.orgId!, role: created.role })
+    ctx.json(res, 201, { invitation: { invitationId: created.invitationId, orgId: created.orgId, email: created.email, role: created.role, expiresAt: created.expiresAt, status: created.status }, token: created.token })
+  }
+
+  async function acceptInvitation(req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
+
+
+
+    if (actor.actorClass !== "user") return ctx.json(res, 403, { error: { code: "FORBIDDEN", message: "invitations require a human session" } })
+    const body = await ctx.readBody(req)
+    const token = typeof body.token === "string" ? body.token.trim() : ""
+    if (!token) return ctx.json(res, 422, { error: { code: "INVALID_INPUT", message: "token required" } })
+    const verifiedEmail = ctx.betterAuth ? ((await ctx.betterAuth.validateSession(req.headers.cookie))?.email ?? null) : null
+
+    try {
+      const member = await ctx.identity.acceptInvitation({ token, principalId: actor.principalId, verifiedEmail })
+      auditAction(ctx, actor, "invitation_accepted", { orgId: member.orgId, role: member.role })
+      ctx.json(res, 201, { tenantId: member.tenantId, orgId: member.orgId, principalId: member.principalId, role: member.role })
+    } catch (error) {
+      if (error instanceof IdentityError) {
+        if (error.code === "INVITATION_EMAIL_MISMATCH") return ctx.json(res, 403, { error: { code: "FORBIDDEN", message: "invitation email does not match the authenticated user" } })
+        if (error.code === "INVITATION_EXPIRED") return ctx.json(res, 409, { error: { code: "INVITATION_EXPIRED", message: "invitation has expired" } })
+        if (error.code === "MEMBER_EXISTS") return ctx.json(res, 409, { error: { code: "MEMBER_EXISTS", message: "already a member" } })
+        if (error.code === "INVITATION_NOT_FOUND" || error.code === "INVITATION_ALREADY_CONSUMED") return ctx.json(res,  404, { error: { code: "NOT_FOUND", message: "invitation not found or already consumed" } })
+      }
+      throw error
+    }
+  }
 async function changeMemberRole(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
   if (!sameOrg(actor, params.orgId!)) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "organization not found" } })
   guard(actor, "member.manage")
@@ -271,7 +363,9 @@ async function revokeCredential(_req: IncomingMessage, res: ServerResponse, para
 async function getSessions(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, actor: Actor, _query: URLSearchParams, ctx: Phase2gRouteContext): Promise<void> {
   const userId = actor.attribution.userId
   if (!userId) return ctx.json(res, 403, { error: { code: "FORBIDDEN", message: "session listing requires a human session actor" } })
-  const sessions = await ctx.authStore.listSessionsForUser(userId)
+  // Tenant-scoped: a session anchored to another tenant of the same auth
+  // user is NEVER listed/revocable from here — org isolation of sessions..
+  const sessions = await ctx.authStore.listSessionsForUser(userId, actor.tenantId)
   ctx.json(res, 200, { sessions: sessions.map(sanitizeSession) })
 }
 
@@ -295,7 +389,9 @@ async function disableUser(_req: IncomingMessage, res: ServerResponse, params: R
   const member = await ctx.identity.getMember(actor.tenantId, actor.orgId, userId)
   if (!member) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "user not found" } })
   const disabled = await ctx.authStore.disableUserIdentity(userId)
-  const revokedCount = await ctx.authStore.revokeAllSessionsForUser(userId)
+  // Tenant-scoped revocation: disabling in THIS org never nukes the user's
+  // sessions in OTHER orgs of the platform..
+  const revokedCount = await ctx.authStore.revokeSessionsForUserInTenant(userId, actor.tenantId)
   auditAction(ctx, actor, "user_identity_disabled", { userId, revokedSessions: revokedCount })
   ctx.json(res, 200, { userId, status: disabled.status, revokedSessions: revokedCount })
 }
@@ -305,7 +401,7 @@ async function revokeUserSessions(_req: IncomingMessage, res: ServerResponse, pa
   const userId = params.userId!
   const member = await ctx.identity.getMember(actor.tenantId, actor.orgId, userId)
   if (!member) return ctx.json(res, 404, { error: { code: "NOT_FOUND", message: "user not found" } })
-  const count = await ctx.authStore.revokeAllSessionsForUser(userId)
+  const count = await ctx.authStore.revokeSessionsForUserInTenant(userId, actor.tenantId)
   auditAction(ctx, actor, "session_revoked", { userId, count })
   ctx.json(res, 200, { revoked: count })
 }
@@ -361,6 +457,11 @@ export const PHASE2G_ROUTES: readonly Phase2gRoute[] = [
   route("POST", "/identity/orgs/:orgId/members", upsertMember),
   route("PATCH", "/identity/orgs/:orgId/members/:principalId", changeMemberRole),
   route("DELETE", "/identity/orgs/:orgId/members/:principalId", removeMember),
+route("POST", "/identity/orgs/:orgId/invitations", createInvitation),
+  route("GET", "/identity/orgs/:orgId/invitations", listInvitations),
+  route("POST", "/identity/orgs/:orgId/invitations/:invitationId/resend", resendInvitation),
+  route("POST", "/identity/orgs/:orgId/invitations/:invitationId/revoke", revokeInvitation),
+  route("POST", "/identity/invitations/accept", acceptInvitation),
   route("POST", "/identity/service-identities", createServiceIdentity),
   route("GET", "/identity/service-identities", listServiceIdentities),
   route("POST", "/identity/service-identities/:id/disable", transitionServiceIdentity("disable")),

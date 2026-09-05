@@ -121,6 +121,7 @@ export const AUDIT_EVENT_TYPES = [
   "authentication_failed",
   "authentication_succeeded",
   "session_revoked",
+  "session_device_changed",
   "user_identity_disabled",
   "service_identity_created",
   "service_identity_disabled",
