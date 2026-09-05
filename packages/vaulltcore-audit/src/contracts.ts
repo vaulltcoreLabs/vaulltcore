@@ -119,16 +119,52 @@ export const AUDIT_EVENT_TYPES = [
   // secrets are stripped by sanitizeMetadata before write. These names are
   // exact — emitted by vaulltcore-auth / phase2g-routes.
   "authentication_failed",
+  "authentication_succeeded",
   "session_revoked",
   "user_identity_disabled",
-  "member_added",
-  "member_removed",
-  "member_role_changed",
   "service_identity_created",
   "service_identity_disabled",
   "service_identity_revoked",
   "machine_credential_issued",
   "machine_credential_revoked",
+  // Phase 3-18: enterprise auth lifecycle. Additive (TEXT-persisted type).
+  // Authentication-flow transitions emit durable, sanitized records; secrets are
+  // stripped by sanitizeMetadata before write. These names are emitted by the
+  // vaulltcore-auth adapter/phase3-7 routes / phase2g control surface.
+
+  "signup_completed",
+  "email_verification_requested",
+  "email_verified",
+  "password_reset_requested",
+  "password_reset_completed",
+  "password_changed",
+  "magic_link_requested",
+  "magic_link_consumed",
+  "otp_requested",
+  "otp_verified",
+  "otp_failed",
+  "mfa_challenge",
+  "mfa_verified",
+  "mfa_enabled",
+  "mfa_disabled",
+  "backup_codes_generated",
+  "backup_code_used",
+  "passkey_registered",
+  "passkey_removed",
+  "oauth_linked",
+  "oauth_unlinked",
+  "sso_provider_created",
+  "sso_provider_updated",
+  "sso_provider_deleted",
+  "sso_domain_verification_requested",
+  "sso_domain_verified",
+  "sso_login_succeeded",
+  "sso_login_failed",
+  "invitation_created",
+  "invitation_accepted",
+  "invitation_revoked",
+  "invitation_expired",
+  "security_notify_sent",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

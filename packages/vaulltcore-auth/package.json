@@ -10,7 +10,8 @@
     "@vaulltcore/identity": "*",
     "@vaulltcore/store-sql": "*",
     "@vaulltcore/audit": "*",
-    "better-auth": "^1.7.1"
+    "better-auth": "^1.7.1",
+    "@vaulltcore/email": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"
