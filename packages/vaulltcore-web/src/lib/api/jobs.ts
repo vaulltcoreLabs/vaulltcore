@@ -3,18 +3,31 @@ import type { JobView, JobEvent } from "@/types";
 import { generateIdempotencyKey } from "@/lib/idempotency";
 
 export const jobsApi = {
-  async create(spec: {
-    spec: Record<string, unknown>;
+  async list(): Promise<JobView[]> {
+    return apiRequest("/jobs");
+  },
+
+  async create(input: {
     engine: string;
     model: string;
     input: string;
     policy?: Record<string, unknown>;
     projectId?: string;
-  }): Promise<{ id: string; reservationId: string; status: string }> {
-    const key = generateIdempotencyKey(`job-create-${Date.now()}`);
+    metadata?: Record<string, unknown>;
+  }, options?: { idempotencyKey?: string }): Promise<{ id: string; reservationId: string; status: string }> {
+    const key = options?.idempotencyKey ?? generateIdempotencyKey(`job-create:${input.engine}:${input.model}:${input.input}`);
     return apiRequest("/jobs", {
       method: "POST",
-      body: spec,
+      body: {
+        spec: {
+          engine: input.engine,
+          model: input.model,
+          input: input.input,
+        },
+        policy: input.policy,
+        projectId: input.projectId,
+        metadata: input.metadata,
+      },
       idempotencyKey: key,
     });
   },

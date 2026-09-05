@@ -1,3 +1,8 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Local runtime SQLite (control-plane serve.ts boot)
+/vaulltcore.db
+/vaulltcore.db-shm
+/vaulltcore.db-wal

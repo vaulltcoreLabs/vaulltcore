@@ -81,6 +81,12 @@ export class NodeSqliteDatabase implements SqlDatabase {
     return NodeSqliteDatabase.open(":memory:")
   }
 
+  /** Escape hatch for tools that require the concrete node:sqlite driver
+   *  (e.g. an ORM adapter seam which detects `DatabaseSync` by shape). */
+  raw(): DatabaseSync {
+    return this.db
+  }
+
   exec(sql: string): void {
     this.db.exec(sql)
   }

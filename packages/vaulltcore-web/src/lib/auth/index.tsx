@@ -4,6 +4,7 @@ import { identityApi } from "@/lib/api";
 
 interface AuthContextValue extends AuthState {
   signIn: (user: AuthUser, permissions?: string[]) => void;
+  signInWithApiKey: (apiKey: string) => Promise<void>;
   signOut: () => void;
   setDevHeaders: (tenant: string, org?: string, project?: string) => void;
 }
@@ -18,45 +19,58 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     permissions: [],
   });
 
-  // Check for existing auth on mount
   useEffect(() => {
-    const storedTenant = localStorage.getItem("vc-tenant");
-    const storedOrg = localStorage.getItem("vc-org");
-    const storedUser = localStorage.getItem("vc-user");
+    let cancelled = false;
+    let devHeader = false;
 
-    if (storedUser) {
-      try {
-        const user = JSON.parse(storedUser) as AuthUser;
+    const devHeaderAuth = import.meta.env.VITE_DEV_HEADER_AUTH === "true";
+    if (devHeaderAuth) {
+      const storedTenant = localStorage.getItem("vc-tenant");
+      if (storedTenant) {
+        devHeader = true;
+        const storedOrg = localStorage.getItem("vc-org");
         setState({
-          user,
+          user: {
+            principalId: "dev-user",
+            tenantId: storedTenant,
+            orgId: storedOrg || undefined,
+          },
           isAuthenticated: true,
           isLoading: false,
           permissions: [],
         });
-      } catch {
-        setState((s) => ({ ...s, isLoading: false }));
       }
-    } else if (storedTenant) {
-      // Header-auth dev mode — create synthetic user
-      setState({
-        user: {
-          principalId: "dev-user",
-          tenantId: storedTenant,
-          orgId: storedOrg || undefined,
-        },
-        isAuthenticated: true,
-        isLoading: false,
-        permissions: [],
-      });
-    } else {
-      setState((s) => ({ ...s, isLoading: false }));
     }
+
+    if (!devHeader) {
+      // Production auth: validate against the server (session cookie or
+      // Bearer machine credential). A client-stored identity is never trusted..
+      identityApi.me().then((me) => {
+        if (cancelled) return;
+        setState({
+          user: {
+            principalId: me.principalId,
+            tenantId: me.tenantId,
+            orgId: me.orgId || undefined,
+          },
+          isAuthenticated: true,
+          isLoading: false,
+          permissions: me.permissions ?? [],
+        });
+      }).catch(() => {
+        if (cancelled) return;
+        setState((s) => ({ ...s, isLoading: false }));
+      });
+    }
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const signIn = useCallback((user: AuthUser, permissions: string[] = []) => {
-    localStorage.setItem("vc-user", JSON.stringify(user));
-    localStorage.setItem("vc-tenant", user.tenantId);
-    if (user.orgId) localStorage.setItem("vc-org", user.orgId);
+    // Dev/header or programmatic flows: no persisted client-side session.
+
     setState({
       user,
       isAuthenticated: true,
@@ -65,7 +79,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const signInWithApiKey = useCallback(async (apiKey: string) => {
+    // Tab-scoped only; the key itself is a secret and must never land in
+    // localStorage/URL/logs. The server verifies it; `me()` confirms identity..
+    sessionStorage.setItem("vc-api-key", apiKey);
+    try {
+      const me = await identityApi.me();
+      setState({
+        user: {
+          principalId: me.principalId,
+          tenantId: me.tenantId,
+          orgId: me.orgId || undefined,
+        },
+        isAuthenticated: true,
+        isLoading: false,
+        permissions: me.permissions ?? [],
+      });
+    } catch (error) {
+      sessionStorage.removeItem("vc-api-key");
+      throw error;
+    }
+  }, []);
+
   const signOut = useCallback(() => {
+    sessionStorage.removeItem("vc-api-key");
     localStorage.removeItem("vc-user");
     localStorage.removeItem("vc-tenant");
     localStorage.removeItem("vc-org");
@@ -96,7 +133,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <AuthContext.Provider value={{ ...state, signIn, signOut, setDevHeaders }}>
+    <AuthContext.Provider value={{ ...state, signIn, signInWithApiKey, signOut, setDevHeaders }}>
       {children}
     </AuthContext.Provider>
   );

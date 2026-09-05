@@ -35,6 +35,8 @@ export interface WorkerHostOptions {
   readonly heartbeatSink?: WorkerHeartbeatSink
   /** Max consecutive empty-claim polls before idling. Default Infinity. */
   readonly maxEmptyPolls?: number
+  /** Delay between empty-claim polls. Default 1000ms. */
+  readonly pollIntervalMs?: number
   /** Hook invoked when a claim's fenced renewal fails (tests/observability). */
   readonly onFenced?: (jobId: string, result: LeaseRenewalResult) => void
 }
@@ -59,6 +61,7 @@ export class WorkerHost {
   private readonly heartbeatIntervalMs: number
   private readonly heartbeatSink?: WorkerHeartbeatSink
   private readonly maxEmptyPolls: number
+  private readonly pollIntervalMs: number
   private readonly onFenced?: (jobId: string, result: LeaseRenewalResult) => void
   private stopped = false
   private activeJobs = new Set<string>()
@@ -72,6 +75,7 @@ export class WorkerHost {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? Math.floor(options.leaseMs / 3)
     this.heartbeatSink = options.heartbeatSink
     this.maxEmptyPolls = options.maxEmptyPolls ?? Number.POSITIVE_INFINITY
+    this.pollIntervalMs = options.pollIntervalMs ?? 1000
     this.onFenced = options.onFenced
     if (this.heartbeatIntervalMs >= options.leaseMs) {
       throw new Error("heartbeatIntervalMs must be less than leaseMs")
@@ -156,6 +160,14 @@ export class WorkerHost {
       const result = await this.runOnce()
       if (!result) {
         empty += 1
+        if (this.maxEmptyPolls === Number.POSITIVE_INFINITY) {
+
+
+          // Without a delay between empty polls an Infinity maxEmptyPolls
+          // becomes a microtask spin that starves timer/I/O events —the process
+          // never finishes starting up (server.listen callback cannot fire).
+          await sleep(this.pollIntervalMs)
+        }
         continue
       }
       empty = 0

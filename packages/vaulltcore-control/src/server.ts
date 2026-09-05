@@ -30,6 +30,7 @@ import { ReconciliationService, type JobIndex, type ReconciliationDeps } from "@
 import type { SnapshotGcDriver } from "@vaulltcore/store-sql"
 import { AUTOMATION_ROUTES, type AutomationLayer, type AutomationRouteContext, buildAutomationLayer } from "./automation-routes"
 import { PHASE2B_ROUTES, type Phase2bRouteContext, type Phase2bLayerOptions } from "./phase2b-routes"
+import { PHASE2D_ROUTES, type Phase2dRouteContext, type Phase2dLayerOptions } from "./phase2d-routes"
 import { PHASE2E_ROUTES, type Phase2eRouteContext, type Phase2eLayerOptions } from "./phase2e-routes"
 import { PHASE2F_ROUTES, type Phase2fRouteContext, type Phase2fLayerOptions, buildPhase2fContext } from "./phase2f-routes"
 import { PHASE2G_ROUTES, type Phase2gRouteContext, type Phase2gLayerOptions } from "./phase2g-routes"
@@ -59,8 +60,13 @@ export interface ControlPlaneOptions {
    *  (for cancel/reconcile) + ops store. Additive; when absent the legacy
    *  behavior is preserved. */
   readonly phase2e?: Phase2eLayerOptions
+  /** Phase 2D: connected-product activation (connections/OAuth/capabilities/
+   *  triggers/dispatch). Additive;when absent the legacy behavior is
+   *  preserved. Requires the credentials lifecycle + trigger store +
+   *  dispatch service. */
+  readonly phase2d?: Phase2dLayerOptions
   /** Phase 2F: durable metering + immutable usage ledger + cost attribution +
-   *  B2B usage governance (/usage/* routes). Additive; when absent the
+   *  B2B usage governance (/usage/* routes). Additive;when absent the
    *  behavior is preserved. */
   readonly phase2f?: Phase2fLayerOptions
   /** Phase 2G: B2B identity/authz hardening. Registers the public `/auth/*`
@@ -133,6 +139,7 @@ export class ControlPlane {
   private readonly automationContext: AutomationRouteContext | null
   private readonly phase2bContext: Phase2bRouteContext | null
   private readonly phase2eContext: Phase2eRouteContext | null
+  private readonly phase2dContext: Phase2dRouteContext | null
   private readonly phase2fContext: Phase2fRouteContext | null
   private readonly phase2gContext: Phase2gRouteContext | null
 
@@ -206,6 +213,29 @@ export class ControlPlane {
     // B2B usage governance (/usage/* routes). Additive; when the layer is
     // absent these routes are not registered and the legacy behavior is
     // preserved.
+    // Phase 2D: connected-product activation. Requires the credentials
+    // lifecycle + trigger store + dispatch service. Additive;absent → no routes.
+    this.phase2dContext = options.phase2d && this.automationContext
+      ? {
+          service: this.automation!.service,
+          credentialStore: options.phase2d.credentialStore,
+          attemptStore: options.phase2d.attemptStore,
+          lifecycle: options.phase2d.lifecycle,
+          oauthAdapters: options.phase2d.oauthAdapters,
+          triggerStore: options.phase2d.triggerStore,
+          dispatchService: options.phase2d.dispatchService,
+          modelConnections: options.phase2d.modelConnections ?? null,
+          webhookStore: options.phase2d.webhookStore ?? null,
+          audit: options.phase2d.audit ?? null,
+          resolvePrincipal: (req, authn) => this.resolvePrincipal(req, authn as AuthnPrincipal),
+          json: (res, status, body) => this.json(res, status, body),
+          readBody: (req) => this.readBody(req),
+        } satisfies Phase2dRouteContext
+      : null
+    // Phase 2F: durable metering + immutable usage ledger + cost attribution +
+    // B2B usage governance (/usage/* routes). Additive;when the layer is
+    // absent these routes are not registered and the legacy behavior is
+    // preserved.
     this.phase2fContext = options.phase2f
       ? buildPhase2fContext(options.phase2f, {
           resolvePrincipal: (req, authn) => this.resolvePrincipal(req, authn as AuthnPrincipal),
@@ -222,6 +252,7 @@ export class ControlPlane {
         }
       : null
     this.add("POST", "/jobs", this.createJob)
+    this.add("GET", "/jobs", this.listJobs)
     this.add("GET", "/jobs/:jobId", this.getJob)
     this.add("POST", "/jobs/:jobId/cancel", this.cancelJob)
     this.add("POST", "/jobs/:jobId/input", this.submitInput)
@@ -311,6 +342,21 @@ export class ControlPlane {
         await matched.handler(req, res, params, actor, url.searchParams, this.phase2gContext)
         return
       }
+      // Phase 2D OAuth callback: UNAUTHENTICATED by design — state nonce
+      // binds tenant/scope before the redirect (sole trust root, replay-safe),
+      // so it MUST be reached before the authenticated pipeline would 401 it.
+      // The provider redirect lands here with no session; the durable state
+      // record resolves tenant+scope from the one-time nonce.
+      if (this.phase2dContext && url.pathname === "/oauth/callback" && req.method === "GET") {
+        const pd2 = PHASE2D_ROUTES.find((r) => r.method === "GET" && r.pattern.test("/oauth/callback")!)
+        if (pd2) {
+          const values = pd2.pattern.exec("/oauth/callback")
+          const params: Record<string, string> = {}
+          pd2.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
+          await pd2.handler(req, res, params, { tenantId: "*", orgId: "*", projectId: "*", admin: false }, url.searchParams, this.phase2dContext)
+          return
+        }
+      }
       const principal = await this.authenticator.authenticate(req)
       if (!principal) {
         this.json(res, 401, { error: { code: "UNAUTHENTICATED", message: "authentication required" } })
@@ -384,6 +430,27 @@ export class ControlPlane {
           await pf.handler(req, res, params, authn, url.searchParams, this.phase2fContext)
           return
         }
+      }
+      // Phase 2D: connected-product activation routes (/connections/*,
+      // /integrations/*, /triggers/*, /oauth/callback). Matched before the
+      // generic routes. Additive; when the phase2d layer is absent this block
+      // is skipped entirely and the legacy behavior is preserved. protected by
+      // the standard authenticated pipeline (login → authorization → tenant
+      // scope as in the other layers. The OAuth callback path is
+      // UNAUTHENTICATED by design: state nonce binds tenant/scope before the
+      // redirect, sole trust root, replay-safe).
+      if (this.phase2dContext && (url.pathname.startsWith("/connections") || url.pathname.startsWith("/integrations") || url.pathname.startsWith("/triggers") || url.pathname.startsWith("/oauth"))) {
+        const pd = PHASE2D_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
+        if (pd) {
+          const values = pd.pattern.exec(url.pathname)
+          const params: Record<string, string> = {}
+          pd.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          await pd.handler(req, res, params, authn, url.searchParams, this.phase2dContext)
+          return
+        }
+        this.json(res, 404, { error: { code: "NOT_FOUND", message: "unknown route" } })
+        return
       }
       const route = this.routes.find((r) => r.method === req.method && r.pattern.test(url.pathname))
       if (!route) {
@@ -564,6 +631,16 @@ export class ControlPlane {
     const job = await this.runner.getJob(jobId)
     if (!job || (job.tenantId !== principal.tenantId && !principal.admin)) return null
     return job
+  }
+
+  private async listJobs(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    const rows = await this.business?.jobs?.listJobsByTenant(principal.tenantId) ?? []
+    const jobs: Array<unknown> = []
+    for (const row of rows) {
+      const job = await this.runner.getJob(row.jobId)
+      if (job) jobs.push(job)
+    }
+    this.json(res, 200, jobs)
   }
 
   private async getJob(req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {

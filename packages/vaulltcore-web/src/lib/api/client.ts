@@ -38,7 +38,10 @@ export async function apiRequest<T>(
     fetchHeaders["Idempotency-Key"] = idempotencyKey;
   }
 
-  // Attach tenant headers for header-auth dev mode
+  const storedKey = typeof window !== "undefined" ? sessionStorage.getItem("vc-api-key") : null;
+  if (storedKey) fetchHeaders["Authorization"] = `Bearer ${storedKey}`;
+  const devHeaderAuth = import.meta.env.VITE_DEV_HEADER_AUTH === "true";
+if (devHeaderAuth) {
   const storedTenant = typeof window !== "undefined" ? localStorage.getItem("vc-tenant") : null;
   if (storedTenant) {
     fetchHeaders["x-vc-tenant"] = storedTenant;
@@ -46,6 +49,7 @@ export async function apiRequest<T>(
     const storedProject = localStorage.getItem("vc-project");
     if (storedOrg) fetchHeaders["x-vc-org"] = storedOrg;
     if (storedProject) fetchHeaders["x-vc-project"] = storedProject;
+  }
   }
 
   const response = await fetch(url, {

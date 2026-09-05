@@ -7,6 +7,7 @@ import type {
   AutomationArtifact,
   ApprovalRequest,
   SanitizedDelivery,
+  AutomationMetrics,
 } from "@/types";
 import { generateIdempotencyKey } from "@/lib/idempotency";
 
@@ -52,6 +53,11 @@ export const automationApi = {
   },
 
   runs: {
+    async list(opts?: { orgId?: string; projectId?: string }): Promise<AutomationRun[]> {
+      const result = await apiRequest<{ runs: AutomationRun[] }>("/automation/runs", { params: opts });
+      return result.runs;
+    },
+
     async create(body: {
       templateId: string;
       versionId: string;
@@ -124,5 +130,10 @@ export const automationApi = {
         { method: "POST", body: { metadata } }
       );
     },
+  },
+
+  async metrics() {
+    const result = await apiRequest<{ metrics: AutomationMetrics }>("/automation/metrics");
+    return result.metrics;
   },
 };
